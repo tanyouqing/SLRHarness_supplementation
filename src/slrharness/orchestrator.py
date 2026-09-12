@@ -10,11 +10,13 @@ The manager is the sole owner of control files and git commits.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 import subprocess
 import sys
 import textwrap
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,9 +34,21 @@ from slrharness.scope_workflow import (
 from slrharness.tmux_runner import (
     WorkerSpec,
     capture_pane,
+    get_pane_pid,
     kill_session,
     spawn_workers,
     wait_for_all,
+)
+from slrharness.topic_execution import (
+    LEGACY_WORKER,
+    TOPIC_COORDINATOR,
+    TopicExecutionConfig,
+    build_coordinator_prompt,
+    finish_topic_attempt,
+    initialize_topic_attempt,
+    record_topic_process,
+    topic_paths,
+    validate_coordinator_outputs,
 )
 
 DEFAULT_MAX_ROUNDS = 5
@@ -43,6 +57,7 @@ DEFAULT_WORKER_TIMEOUT = 600  # seconds
 DEFAULT_MANAGER_TIMEOUT = 900  # seconds (manager does heavier reasoning)
 
 WORKER_SESSION = "slr-workers"
+COORDINATOR_SESSION = "slr-topic-coordinators"
 MANAGER_SESSION = "slr-manager"
 
 
@@ -52,6 +67,28 @@ class Task:
 
     topic_path: str  # e.g., "topics/efficiency/pruning"
     description: str  # Free-form description
+    execution_mode: str | None = None
+
+
+@dataclass(frozen=True)
+class CoordinatorInvocation:
+    """One deterministic top-level coordinator process request."""
+
+    task: Task
+    attempt: int
+    command: list[str]
+    prompt: str
+
+
+@dataclass(frozen=True)
+class CoordinatorProcessResult:
+    """Observable process result returned by a coordinator batch executor."""
+
+    completed: bool
+    exit_code: int | None
+    timed_out: bool
+    output: str = ""
+    pid: int | None = None
 
 
 def check_common_dependencies() -> None:
@@ -98,7 +135,20 @@ def parse_pending_tasks(tasks_md: Path) -> list[Task]:
     for match in pattern.finditer(content):
         topic_path = match.group(1).rstrip("/")
         description = match.group(2).strip()
-        tasks.append(Task(topic_path=topic_path, description=description))
+        execution_mode = None
+        mode_match = re.match(
+            r"^\[mode=(legacy_worker|topic_coordinator)\]\s*", description
+        )
+        if mode_match:
+            execution_mode = mode_match.group(1)
+            description = description[mode_match.end() :].strip()
+        tasks.append(
+            Task(
+                topic_path=topic_path,
+                description=description,
+                execution_mode=execution_mode,
+            )
+        )
 
     return tasks
 
@@ -187,7 +237,11 @@ def build_manager_prompt(workspace: Path, round_num: int, phase: str) -> str:
         - SCOPE.md (living scope, includes ranking & grouping criteria)
         - TASKS.md (task registry, checkbox format)
         - SUMMARY.md (evolving synthesis with comparison tables)
-        - topics/ (worker output, organized by topic; READ ONLY for you)
+        - topics/ (READ ONLY). A TASKS entry `topics/x/y` has exactly one
+          primary synthesis at `topics/x/y.md`. A same-stem directory
+          `topics/x/y/` contains supporting paper notes, technical notes,
+          audits, task state, and a coordinator manifest; these are evidence
+          attachments, not additional topics.
     """)
 
     if phase == "plan":
@@ -220,7 +274,11 @@ def build_manager_prompt(workspace: Path, round_num: int, phase: str) -> str:
             REVIEW PASS -- your responsibilities this invocation:
 
             1. Check `git status` and `git diff` to see what workers produced.
-            2. For each new or modified file in topics/, validate:
+            2. For each TASKS topic, validate its primary `topics/.../*.md`
+               synthesis. Do not count supporting notes below its same-stem
+               directory as separate topics. You may consult
+               `coordinator_manifest.json`, `task.json`, paper notes, technical
+               notes, and metadata audit as supporting evidence. Validate:
                - Required sections present (Summary, Key Findings,
                  Comparison Data, References, Sources, Related Topics)
                - Inclusion/exclusion criteria from SCOPE.md were applied
@@ -464,6 +522,198 @@ def run_workers(
     }
 
 
+CoordinatorBatchExecutor = Callable[
+    [Path, list[CoordinatorInvocation], int],
+    dict[str, CoordinatorProcessResult],
+]
+
+
+def _execute_coordinator_batch(
+    workspace: Path,
+    invocations: list[CoordinatorInvocation],
+    timeout: int,
+) -> dict[str, CoordinatorProcessResult]:
+    """Run one top-level coordinator process per topic in parallel via tmux."""
+    if not invocations:
+        return {}
+    specs: list[WorkerSpec] = []
+    by_window: dict[str, CoordinatorInvocation] = {}
+    for index, invocation in enumerate(invocations, start=1):
+        window = f"topic-{index}"
+        task_id = topic_paths(workspace, invocation.task.topic_path).task_id
+        status_path = _agent_status_path(
+            workspace,
+            f"coordinator-{task_id}-attempt-{invocation.attempt}",
+        )
+        spec = WorkerSpec(
+            window_name=window,
+            command=invocation.command,
+            done_channel=f"coordinator-{task_id}-{invocation.attempt}-done",
+            cwd=workspace,
+            exit_status_path=status_path,
+        )
+        specs.append(spec)
+        by_window[window] = invocation
+
+    spawn_workers(COORDINATOR_SESSION, specs)
+    pids: dict[str, int | None] = {}
+    for spec in specs:
+        invocation = by_window[spec.window_name]
+        paths = topic_paths(workspace, invocation.task.topic_path)
+        pid = get_pane_pid(COORDINATOR_SESSION, spec.window_name)
+        pids[spec.window_name] = pid
+        state = json.loads(paths.task_state.read_text(encoding="utf-8"))
+        record_topic_process(paths, state, COORDINATOR_SESSION, spec.window_name, pid)
+
+    completed = wait_for_all(specs, timeout=timeout)
+    results: dict[str, CoordinatorProcessResult] = {}
+    for spec in specs:
+        invocation = by_window[spec.window_name]
+        results[invocation.task.topic_path] = CoordinatorProcessResult(
+            completed=completed[spec.window_name],
+            exit_code=_read_agent_exit_code(spec.exit_status_path),
+            timed_out=not completed[spec.window_name],
+            output=capture_pane(COORDINATOR_SESSION, spec.window_name),
+            pid=pids[spec.window_name],
+        )
+    kill_session(COORDINATOR_SESSION)
+    return results
+
+
+def _read_topic_state(path: Path) -> dict[str, object] | None:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def run_topic_coordinators(
+    workspace: Path,
+    tasks: list[Task],
+    round_num: int,
+    config: TopicExecutionConfig,
+    backend: AgentBackend,
+    batch_executor: CoordinatorBatchExecutor = _execute_coordinator_batch,
+) -> dict[str, bool]:
+    """Run, validate, retry, and resume deterministic topic coordinators."""
+    results = {task.topic_path: False for task in tasks}
+    pending: dict[str, tuple[Task, int, list[str]]] = {}
+
+    for task in tasks:
+        paths = topic_paths(workspace, task.topic_path)
+        prior = _read_topic_state(paths.task_state)
+        prior_status = prior.get("status") if prior else None
+        if prior_status in {"COMPLETE", "PARTIAL"}:
+            validation = validate_coordinator_outputs(workspace, paths, config)
+            if validation.accepted:
+                results[task.topic_path] = True
+                continue
+        previous_attempt = prior.get("attempt", 0) if prior else 0
+        if not isinstance(previous_attempt, int):
+            previous_attempt = 0
+        diagnostics = prior.get("diagnostics", []) if prior else []
+        if not isinstance(diagnostics, list):
+            diagnostics = []
+        pending[task.topic_path] = (
+            task,
+            previous_attempt + 1,
+            [str(item) for item in diagnostics],
+        )
+
+    for retry_index in range(config.coordinator_retries + 1):
+        if not pending:
+            break
+        invocations: list[CoordinatorInvocation] = []
+        states: dict[str, dict[str, object]] = {}
+        for topic_path, (task, attempt, diagnostics) in pending.items():
+            paths = topic_paths(workspace, topic_path)
+            state = initialize_topic_attempt(
+                paths,
+                task.description,
+                round_num,
+                attempt,
+                config,
+                diagnostics,
+            )
+            states[topic_path] = state
+            prompt = build_coordinator_prompt(
+                workspace,
+                paths,
+                task.description,
+                round_num,
+                attempt,
+                config,
+                diagnostics,
+            )
+            invocations.append(
+                CoordinatorInvocation(
+                    task=task,
+                    attempt=attempt,
+                    command=backend.build_command(
+                        config.coordinator_agent, prompt, cwd=workspace
+                    ),
+                    prompt=prompt,
+                )
+            )
+
+        process_results = batch_executor(
+            workspace, invocations, config.coordinator_timeout_seconds
+        )
+        next_pending: dict[str, tuple[Task, int, list[str]]] = {}
+        for invocation in invocations:
+            task = invocation.task
+            paths = topic_paths(workspace, task.topic_path)
+            process = process_results.get(task.topic_path)
+            diagnostics: list[str] = []
+            validation = None
+            if process is None:
+                diagnostics.append("Coordinator executor returned no process result")
+            elif process.timed_out or not process.completed:
+                diagnostics.append("Coordinator process timed out")
+            elif process.exit_code != 0:
+                diagnostics.append(
+                    f"Coordinator exited with status {process.exit_code}"
+                )
+            else:
+                validation = validate_coordinator_outputs(workspace, paths, config)
+                diagnostics.extend(validation.errors)
+                diagnostics.extend(validation.warnings)
+
+            accepted = validation is not None and validation.accepted
+            status = validation.effective_status if accepted else "FAILED"
+            state = states[task.topic_path]
+            if process:
+                state = record_topic_process(
+                    paths,
+                    state,
+                    COORDINATOR_SESSION,
+                    f"topic-{invocations.index(invocation) + 1}",
+                    process.pid,
+                )
+            finish_topic_attempt(
+                paths,
+                state,
+                status,
+                process.exit_code if process else None,
+                process.timed_out if process else False,
+                diagnostics,
+            )
+            if accepted:
+                results[task.topic_path] = True
+            elif retry_index < config.coordinator_retries:
+                next_pending[task.topic_path] = (
+                    task,
+                    invocation.attempt + 1,
+                    diagnostics,
+                )
+        pending = next_pending
+
+    return results
+
+
 def _agent_status_path(workspace: Path, run_name: str) -> Path:
     """Return a per-invocation exit-status path inside the workspace git dir."""
     run_dir = workspace / ".git" / "slrharness-runs"
@@ -496,7 +746,14 @@ def print_status(workspace: Path) -> None:
     pending = parse_pending_tasks(tasks_md) if tasks_md.is_file() else []
     completed = count_completed_tasks(tasks_md)
     topic_files = (
-        [p for p in topics_dir.rglob("*.md") if p.name != "_index.md"]
+        [
+            p
+            for p in topics_dir.rglob("*.md")
+            if p.name != "_index.md"
+            and "papers" not in p.parts
+            and "technical_sources" not in p.parts
+            and "audits" not in p.parts
+        ]
         if topics_dir.is_dir()
         else []
     )
@@ -602,6 +859,7 @@ def run_slr(
     manager_timeout: int,
     backend: AgentBackend,
     allow_dirty: bool = False,
+    topic_config: TopicExecutionConfig | None = None,
 ) -> None:
     """Execute the manager-worker loop.
 
@@ -637,6 +895,7 @@ def run_slr(
             f"in the next manager commit."
         )
 
+    topic_config = topic_config or TopicExecutionConfig()
     last_round = current_round(workspace)
     start_round = last_round + 1
     end_round = start_round + max_rounds  # exclusive
@@ -676,10 +935,31 @@ def run_slr(
         for task in tasks_this_round:
             print(f"  - {task.topic_path}: {task.description[:70]}")
 
-        # Run workers in parallel
-        worker_results = run_workers(
-            workspace, tasks_this_round, round_num, worker_timeout, backend
-        )
+        legacy_tasks = [
+            task
+            for task in tasks_this_round
+            if (task.execution_mode or topic_config.mode) == LEGACY_WORKER
+        ]
+        coordinator_tasks = [
+            task
+            for task in tasks_this_round
+            if (task.execution_mode or topic_config.mode) == TOPIC_COORDINATOR
+        ]
+        worker_results: dict[str, bool] = {}
+        if legacy_tasks:
+            worker_results.update(
+                run_workers(workspace, legacy_tasks, round_num, worker_timeout, backend)
+            )
+        if coordinator_tasks:
+            worker_results.update(
+                run_topic_coordinators(
+                    workspace,
+                    coordinator_tasks,
+                    round_num,
+                    topic_config,
+                    backend,
+                )
+            )
         completed = sum(1 for v in worker_results.values() if v)
         print(
             f"[round {round_num}] "
@@ -751,6 +1031,35 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--topic-execution-mode",
+        choices=(LEGACY_WORKER, TOPIC_COORDINATOR),
+        default=LEGACY_WORKER,
+        help="How each unannotated topic task is executed (default: legacy_worker).",
+    )
+    parser.add_argument(
+        "--coordinator-timeout",
+        type=int,
+        default=3600,
+        help="Shared timeout in seconds for a topic-coordinator batch.",
+    )
+    parser.add_argument(
+        "--coordinator-retries",
+        type=int,
+        default=1,
+        help="Retries after a failed coordinator attempt (default: 1).",
+    )
+    parser.add_argument(
+        "--allow-partial-completion",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Accept disclosed PARTIAL coordinator output (default: enabled).",
+    )
+    parser.add_argument("--target-papers", type=int, default=10)
+    parser.add_argument("--max-paper-candidates", type=int, default=30)
+    parser.add_argument("--target-technical-sources", type=int, default=5)
+    parser.add_argument("--max-technical-candidates", type=int, default=15)
+    parser.add_argument("--max-correction-rounds", type=int, default=2)
+    parser.add_argument(
         "--agent-backend",
         default=DEFAULT_BACKEND,
         choices=available_backends(),
@@ -808,6 +1117,20 @@ def main(argv: list[str] | None = None) -> None:
     backend = get_backend(args.agent_backend)
     check_common_dependencies()
     backend.check_available()
+    try:
+        topic_config = TopicExecutionConfig(
+            mode=args.topic_execution_mode,
+            allow_partial_completion=args.allow_partial_completion,
+            coordinator_timeout_seconds=args.coordinator_timeout,
+            coordinator_retries=args.coordinator_retries,
+            target_papers=args.target_papers,
+            max_paper_candidates=args.max_paper_candidates,
+            target_technical_sources=args.target_technical_sources,
+            max_technical_candidates=args.max_technical_candidates,
+            max_correction_rounds=args.max_correction_rounds,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     run_slr(
         workspace=args.workspace.resolve(),
         max_rounds=args.max_rounds,
@@ -816,6 +1139,7 @@ def main(argv: list[str] | None = None) -> None:
         manager_timeout=args.manager_timeout,
         backend=backend,
         allow_dirty=args.allow_dirty,
+        topic_config=topic_config,
     )
 
 

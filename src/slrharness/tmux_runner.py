@@ -156,6 +156,28 @@ def capture_pane(session: str, window: str, lines: int = 200) -> str:
     return result.stdout
 
 
+def get_pane_pid(session: str, window: str) -> int | None:
+    """Return the shell PID for a tmux window, if it can be queried."""
+    result = subprocess.run(
+        [
+            "tmux",
+            "display-message",
+            "-p",
+            "-t",
+            f"{session}:{window}",
+            "#{pane_pid}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
 def spawn_workers(
     session: str,
     workers: Iterable[WorkerSpec],

@@ -148,6 +148,27 @@ The manager agent's prompt includes an explicit constraint: before writing any c
 
 ## 4. File Structure
 
+### Optional coordinated topic execution
+
+`--topic-execution-mode topic_coordinator` changes only the execution of each
+Manager-created topic task. The outer orchestrator still owns scheduling and
+starts one top-level process per task, but that process invokes three ordinary
+Claude Code subagents inside one session: an academic paper worker and a
+technical-source worker in parallel, followed by a metadata-only checker. The
+legacy `topics/<topic>/<subtopic>.md` remains the Manager's primary input.
+
+Supporting artifacts live next to it under
+`topics/<topic>/<subtopic>/` (`task.json`, stable per-source notes and indexes,
+metadata audit, correction queue, coordination log, and coordinator manifest).
+The outer orchestrator validates identity, containment, required files, counts,
+status, and partial-result disclosure before Manager Review. Accepted tasks are
+skipped on resume; failed tasks retain their evidence and receive bounded
+retries with prior diagnostics.
+
+No Agent Teams are enabled. Metadata corrections use the durable
+`audits/correction_requests.jsonl` queue, after which the coordinator re-invokes
+the academic worker and checker within a fixed correction budget.
+
 ```text
 PACKAGE_ROOT/
 ├── plugins/

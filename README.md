@@ -178,6 +178,76 @@ mark those claims `[UNVERIFIED]`, and record the failures in
 `SCOPE_SOURCES.md`. Zero successfully read surveys is valid; it is not evidence
 that the field has no literature.
 
+## Coordinated topic execution (Claude Code)
+
+The original single-worker path remains the default for old commands and
+workspaces. To upgrade each selected topic task to one deterministic top-level
+Claude Code coordinator, run:
+
+```bash
+uv run python -m slrharness.orchestrator run \
+  --workspace workspaces/agent-memory \
+  --agent-backend claude-code \
+  --topic-execution-mode topic_coordinator \
+  --num-workers 3 \
+  --coordinator-timeout 3600 \
+  --coordinator-retries 1
+```
+
+The orchestrator starts exactly one `claude --agent topic-coordinator -p ...`
+process for each selected topic and owns its task ID, attempt, timeout, PID,
+exit status, validation, retry, and resume decision. Inside that one session,
+the coordinator launches `academic-paper-worker` and
+`technical-source-worker` concurrently as ordinary named subagents, then runs
+`academic-metadata-checker` after the paper manifest exists. The checker only
+audits publication identity and metadata.
+
+This mode deliberately does not enable Claude Code Agent Teams. Ordinary
+subagents currently do not expose team peer `SendMessage`, so corrections use
+the durable `audits/correction_requests.jsonl` queue: the coordinator invokes
+the academic worker to apply pending requests, then invokes the checker again,
+for at most `--max-correction-rounds` rounds. This is also the mandatory
+fallback if messaging capabilities change or fail in a later CLI version.
+
+Each task keeps its Manager-compatible primary synthesis and an adjacent
+supporting tree:
+
+```text
+topics/<topic>/<subtopic>.md                 # primary Manager input
+topics/<topic>/<subtopic>/
+├── task.json                               # program-owned attempt/process state
+├── papers/index.json                       # or papers/NO_RESULTS.md
+├── papers/<stable-paper-slug>.md
+├── technical_sources/index.json            # or NO_RESULTS.md
+├── technical_sources/<stable-source-slug>.md
+├── audits/metadata_check.json
+├── audits/correction_requests.jsonl
+├── coordination_log.jsonl
+└── coordinator_manifest.json
+```
+
+The Manager treats only the task's top-level `.md` file as a topic. Supporting
+notes and audits may be consulted as evidence but are never counted as extra
+topics. A coordinator output is accepted only when the synthesis, academic
+index/no-result record, technical index/no-result record, metadata audit, task
+identity, paths, counts, and final status pass deterministic validation.
+Disclosed `PARTIAL` results are accepted by default; use
+`--no-allow-partial-completion` to reject them.
+
+Re-run the same command to resume. A previously accepted COMPLETE/PARTIAL task
+is not launched again; failed attempts retain valid notes and receive the last
+diagnostics in the next coordinator prompt. To force the historical behavior,
+use `--topic-execution-mode legacy_worker`. An individual TASKS entry can
+override the global mode by starting its description with
+`[mode=legacy_worker]` or `[mode=topic_coordinator]`.
+
+Search access is role-scoped: academic worker and metadata checker use arXiv,
+scholarly, and WebSearch/WebFetch fallbacks; the technical worker alone uses
+optional Tavily plus WebSearch/WebFetch. No API key is written to project
+files. This implementation was exercised with Claude Code 2.1.269; use a
+current stable Claude Code release and verify agents/MCP connections before a
+real run.
+
 ### Scope workspace files and discovery
 
 Before approval, a new workspace contains:
@@ -188,8 +258,9 @@ SCOPE_PROPOSAL.md
 SCOPE_SOURCES.md
 SLR_STATE.json
 scope_revisions/revision-N/
-.claude/agents/{slr-scoper,slr-manager,slr-worker}.md
-.claude/skills/slr-scoping/SKILL.md
+.claude/agents/{slr-scoper,slr-manager,slr-worker,topic-coordinator,
+  academic-paper-worker,academic-metadata-checker,technical-source-worker}.md
+.claude/skills/{slr-scoping,slr-topic-research}/SKILL.md
 ```
 
 `SLR_STATE.json` records the initial topic, current status and revision,
@@ -289,6 +360,13 @@ Flags:
 - `--worker-timeout` — per-worker timeout in seconds (default: `600`)
 - `--manager-timeout` — per-manager-invocation timeout in seconds (default: `900`)
 - `--allow-dirty` — proceed even if the workspace has uncommitted changes (they'll be folded into the next manager commit)
+- `--topic-execution-mode` — `legacy_worker` (default) or `topic_coordinator`
+- `--coordinator-timeout` — shared timeout for a coordinator batch (default: `3600`)
+- `--coordinator-retries` — retries after the initial attempt (default: `1`)
+- `--[no-]allow-partial-completion` — accept or reject disclosed partial output
+- `--target-papers`, `--max-paper-candidates` — bounded academic search budgets
+- `--target-technical-sources`, `--max-technical-candidates` — bounded technical search budgets
+- `--max-correction-rounds` — bounded file-queue correction/recheck cycles
 
 Each round runs as: **manager plan pass → workers (parallel) → manager review pass**. The manager owns all control files and commits twice per round (`round-N-plan`, `round-N-review`). Workers write only to `topics/` and `assets/`.
 
