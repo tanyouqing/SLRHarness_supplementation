@@ -1,0 +1,32 @@
+{
+  "schema_version": "1.0",
+  "scope": {
+    "target_surveys": 3,
+    "max_initial_candidates": 5,
+    "minimum_successful_surveys": 0
+  },
+  "topic_execution": {
+    "mode": "topic_coordinator",
+    "target_papers": 8,
+    "max_paper_candidates": 20,
+    "target_technical_sources": 3,
+    "max_technical_candidates": 8,
+    "max_correction_rounds": 2
+  },
+  "academic_worker": {"citation_chaining": "bounded"},
+  "metadata_checker": {"content_checking": false},
+  "technical_worker": {"tavily_required": false},
+  "communication": {"file_queue_fallback": true},
+  "paper_notes": {"template": ".claude/templates/paper-note.md"},
+  "source_registry": {"enabled": true, "deduplicate": true},
+  "finalization": {
+    "enabled": true,
+    "finalizer_agent": "slr-manager",
+    "canonical_report": "SUMMARY.md",
+    "max_prefinal_repair_rounds": 1,
+    "allow_finalize_with_limitations": true,
+    "finalizer_retries": 1,
+    "allow_complete_with_warnings": true
+  },
+  "backends": {"default": "claude-code"}
+}

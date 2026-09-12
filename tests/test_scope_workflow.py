@@ -345,6 +345,8 @@ def test_workspace_contains_discoverable_agents_and_skill(tmp_path: Path) -> Non
     assert (workspace / ".claude/agents/technical-source-worker.md").is_file()
     assert (workspace / ".claude/skills/slr-scoping/SKILL.md").is_file()
     assert (workspace / ".claude/skills/slr-topic-research/SKILL.md").is_file()
+    assert (workspace / ".claude/templates/paper-note.md").is_file()
+    assert (workspace / ".claude/templates/final-report.md").is_file()
 
 
 def test_unapproved_workspace_never_calls_manager(

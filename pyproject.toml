@@ -21,6 +21,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.scripts]
+slrharness = "slrharness.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/yourname/slrharness"
 Documentation = "https://github.com/yourname/slrharness#readme"
@@ -72,3 +75,6 @@ known-first-party = ["slrharness"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "live: opt-in tests that may invoke Claude Code and external services",
+]

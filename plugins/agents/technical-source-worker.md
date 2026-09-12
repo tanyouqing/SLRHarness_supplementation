@@ -22,3 +22,8 @@ Never present a technical source as a peer-reviewed paper. Produce one stable
 note per included source plus `technical_sources/index.json`, or an explicit
 `technical_sources/NO_RESULTS.md` when access yields no reliable source. Do not
 write the topic synthesis or modify protected workspace control files.
+
+Every note must expose the shared skill's stable Source ID, first/third-party
+classification, claims, evidence locators, related Paper IDs, reliability
+caveats, and verification status; never collapse these into an unstructured
+bookmark list.

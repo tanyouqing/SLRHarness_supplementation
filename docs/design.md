@@ -169,6 +169,28 @@ No Agent Teams are enabled. Metadata corrections use the durable
 `audits/correction_requests.jsonl` queue, after which the coordinator re-invokes
 the academic worker and checker within a fixed correction budget.
 
+### Global finalization state machine
+
+The scope lifecycle remains authoritative and approved. A separate
+`SLR_STATE.json.finalization` subtree records program-owned progress through
+topic completion, source aggregation, pre-final audit, optional bounded repair,
+ready/running synthesis, final validation, COMPLETE, or awaiting intervention.
+Every phase is restartable; source aggregation is deterministic and finalizer
+validation failure retries only the Manager writing phase.
+
+The program builds `artifacts/SOURCE_REGISTRY.json`, `PAPER_LIST.md`, and
+`REFERENCES.md` from accepted topic manifests. It validates the bundled
+paper-note contract, merges DOI/arXiv/version duplicates while retaining every
+note path, and keeps technical sources in a separate registry collection. One
+semantic pre-final Manager pass may propose stable gap IDs; at most the
+configured repair limit is executed through the existing Topic Coordinator.
+
+Finally, the existing Manager writes canonical `SUMMARY.md` from explicit
+persisted inputs without searching. Program validation—not agent exit status—
+enforces the ordered five-section English structure, provenance IDs,
+references, comparison content, delivery statistics, and warning policy before
+the state becomes COMPLETE.
+
 ```text
 PACKAGE_ROOT/
 ├── plugins/
@@ -481,7 +503,7 @@ def run_slr(workspace: Path, max_rounds: int, num_workers: int, worker_timeout: 
        b. Spawn workers in parallel tmux windows, one task each
        c. Wait for all workers (with timeout)
        d. Manager review pass: validate output, update TASKS.md + SUMMARY.md, commit
-       e. Manager plan pass: evolve scope, plan next round, commit
+       e. Manager plan pass: preserve approved scope, plan next round, commit
     3. Manager writes final SUMMARY.md, orchestrator tags
     """
 ```

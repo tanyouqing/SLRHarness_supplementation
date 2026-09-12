@@ -2,9 +2,21 @@
 
 **Scientific Literature Review Harness** — an agentic system for conducting reproducible literature reviews using CLI agents (Kiro, Claude Code, etc.) in a manager–worker loop.
 
-SLRHarness turns a filled-in scope document into a structured, version-controlled knowledge base. A **manager agent** plans, synthesizes, and commits; **worker agents** search databases in parallel and produce narrow topic notes. A lightweight Python orchestrator drives the loop and records each round as git commits.
+SLRHarness turns an initial research direction into an approved, structured,
+version-controlled literature review. A Python orchestrator owns lifecycle state,
+validation, retry, and Git boundaries; bounded Claude Code agents own research and
+written synthesis.
 
-For the architecture, design rationale, and methodology, see [`docs/design.md`](docs/design.md).
+See [`docs/architecture.md`](docs/architecture.md),
+[`docs/artifact-contracts.md`](docs/artifact-contracts.md), and
+[`docs/development.md`](docs/development.md).
+
+Chinese v1 handoff documents:
+
+- [`docs/v1-update-overview.zh-CN.md`](docs/v1-update-overview.zh-CN.md) — stages,
+  features, and file responsibilities added in v1;
+- [`docs/claude-code-setup-guide.zh-CN.md`](docs/claude-code-setup-guide.zh-CN.md)
+  — installation, Claude Code/MCP setup, first run, and remaining live checks.
 
 ## Bring your own tools
 
@@ -25,9 +37,9 @@ The more capable your agent's toolset, the more ground each worker can cover per
 
 - Python ≥ 3.11
 - [`uv`](https://docs.astral.sh/uv/) for dependency management
-- [`tmux`](https://github.com/tmux/tmux) — required for the formal
-  manager/worker rounds. Run SLRHarness on Linux, macOS, or WSL; this release
-  does not add native Windows orchestration support.
+- [`tmux`](https://github.com/tmux/tmux) — required for formal rounds. The v1
+  runtime target is Linux or WSL; native Windows and macOS orchestration are not
+  supported.
 - An agent CLI backend (at least one):
   - [`kiro-cli`](https://kiro.dev/docs/cli/) — Kiro agent runtime (authenticated), or
   - [`claude`](https://docs.anthropic.com/en/docs/claude-code) — Claude Code CLI
@@ -39,7 +51,37 @@ The more capable your agent's toolset, the more ground each worker can cover per
 git clone https://github.com/yourname/slrharness.git
 cd slrharness
 uv sync --group dev
+uv run slrharness doctor
+uv run pytest
 ```
+
+The installed `slrharness` entry point is canonical. Historical
+`python -m slrharness.scope` and `python -m slrharness.orchestrator` commands
+remain supported. Diagnose the environment and validate a project without
+running agents or changing files:
+
+```bash
+slrharness doctor --workspace workspaces/agent-memory
+slrharness status workspaces/agent-memory
+slrharness validate workspaces/agent-memory
+```
+
+`status` is a read-only validation snapshot. Errors, warnings, and informational
+counts are printed separately. Mutating `run` and `finalize` commands take a
+workspace-specific lock under `.git/.slrharness.lock`; a second process is
+rejected. Remove that exact file only after confirming its recorded PID is no
+longer running.
+
+Validate and expand the key-free v1 configuration example with:
+
+```bash
+slrharness config plugins/config/example-config.json
+```
+
+Missing fields receive centralized defaults; unknown sections/fields, unsupported
+schema versions, invalid modes, negative budgets, and excessive bounds fail
+validation. CLI flags remain the execution interface in v1; the example documents
+the equivalent complete configuration contract without storing credentials.
 
 ## First use with Claude Code: start from a topic
 
@@ -248,6 +290,142 @@ files. This implementation was exercised with Claude Code 2.1.269; use a
 current stable Claude Code release and verify agents/MCP connections before a
 real run.
 
+## Finalization, global provenance, and bounded repair
+
+When Manager Review leaves no pending tasks, the same orchestrator now runs:
+
+```text
+topic completion
+→ source aggregation
+→ pre-final audit
+→ optional bounded gap repair
+→ final synthesis
+→ deterministic final validation
+→ COMPLETE
+```
+
+`SUMMARY.md` remains the single canonical report. The explicit `finalize`
+subcommand resumes this pipeline without rerunning completed topics:
+
+```bash
+uv run python -m slrharness.orchestrator finalize \
+  --workspace workspaces/agent-memory \
+  --agent-backend claude-code \
+  --topic-execution-mode topic_coordinator
+```
+
+Normal `orchestrator run` invokes the same finalization automatically. Use
+`--no-finalization` only when intentionally running the historical research
+rounds without a final report. Finalization state is program-owned under
+`SLR_STATE.json.finalization`; the top-level scope approval state remains
+unchanged.
+
+### Canonical paper notes
+
+Every included paper follows the distributed template at
+`.claude/templates/paper-note.md` (source asset:
+`plugins/templates/paper-note.md`). Notes carry machine-readable frontmatter,
+a stable local Paper ID, access and reading depth, reported facts versus
+reviewer interpretation, experimental context, limitations, and evidence
+locators. `Not reported`, `Not applicable`, unavailable values, and
+`[UNVERIFIED]` are valid; missing evidence is never guessed. Metadata Checker
+continues to verify only identity/version metadata.
+
+The deterministic validator checks required fields and sections, legal access
+and reading states, index/note agreement, corrected metadata, duplicate
+DOI/arXiv identities, and whether concrete numbers retain evidence context. It
+writes `artifacts/audits/paper_note_validation.json` without deleting notes.
+
+### Global source registry
+
+Aggregation walks parseable accepted coordinator manifests rather than asking
+an LLM to guess the directory tree. It creates:
+
+```text
+artifacts/
+├── PAPER_LIST.md
+├── SOURCE_REGISTRY.json
+├── REFERENCES.md
+└── audits/
+    ├── paper_note_validation.json
+    ├── source_deduplication.json
+    ├── prefinal_audit.json
+    └── final_audit.json
+```
+
+Academic IDs are deterministic SHA-256-derived `P...` values, preferring a
+normalized DOI, then version-free arXiv ID, then an exact normalized
+title/first-author fallback. Technical IDs are deterministic `T...` values
+based primarily on canonical URL. Existing registry IDs are reused on rebuild.
+DOI, arXiv ID, explicit version group, and only then exact title/author identity
+drive merging. Original topic notes are retained, aliases and every covered
+topic are recorded, and technical/web sources remain separate from papers.
+
+`REFERENCES.md` is generated from the registry, with unresolved fields marked
+`[UNVERIFIED METADATA]`; the Finalizer cannot invent a replacement reference.
+
+### Pre-final audit and repair limit
+
+The program first checks required syntheses, manifests, indexes/no-result
+records, metadata audits, note validation, registry/dedup output, unresolved
+metadata, and supporting-note traceability. One bounded `slr-manager`
+invocation then checks semantic coverage for the five report sections without
+web search. Stable `GAP-...` IDs prevent repair tasks from being rediscovered
+under new dynamic IDs.
+
+Blocking gaps reuse the existing Manager task format and Topic Coordinator
+pipeline. The default maximum is one repair round, configurable from zero to
+three:
+
+```bash
+--max-prefinal-repair-rounds 1
+```
+
+After repair, aggregation and audit run again. At the limit, the system either
+finalizes with explicit limitations (default) or stops when
+`--no-allow-finalize-with-limitations` is set. This is a bounded state machine,
+not Ralph Loop or Agent Teams.
+
+### Five-section English report and validation
+
+The Manager is reused as the Finalizer because it already owns `SUMMARY.md`
+and Git commits. It receives explicit scope, topic, registry, paper-list,
+references, note-root, and audit paths and has no search MCP. It must write, in
+order:
+
+1. Academic Terminology and Problem Boundaries
+2. Background, Importance, and Broader Significance
+3. Existing Research: Motivations, Methodologies, and Findings
+4. Research Landscape: Consensus, Differences, and Experimental Practice
+5. Evidence-Backed Research Opportunities
+
+Coverage and Limitations, Sources and Provenance, References, and Delivery
+Status follow those five sections. Final validation checks headings/order,
+comparison table, experimental/consensus/difference coverage, supported
+opportunities, known registry IDs, reference uniqueness/completeness, numeric
+claim citations, placeholders, English-language mixing, canonical path, and
+exact program-provided Delivery Status counts. A zero exit code alone never
+marks the review complete.
+
+Errors trigger only a bounded Finalizer retry and are passed back as precise
+diagnostics; completed topic research is not rerun. Warnings are recorded and
+may complete by default; use `--no-allow-complete-with-warnings` for strict
+handling. Inspect progress and audits with implemented commands:
+
+```bash
+uv run python -m slrharness.orchestrator status \
+  --workspace workspaces/agent-memory
+
+cat workspaces/agent-memory/artifacts/audits/prefinal_audit.json
+cat workspaces/agent-memory/artifacts/audits/final_audit.json
+```
+
+To resume an interrupted aggregation, repair, or failed Finalizer, rerun the
+same `finalize` command. It rebuilds aggregation safely, does not duplicate
+stable repair tasks, preserves failed report drafts under
+`artifacts/final_drafts/`, and skips report generation once a valid COMPLETE
+state exists.
+
 ### Scope workspace files and discovery
 
 Before approval, a new workspace contains:
@@ -261,6 +439,7 @@ scope_revisions/revision-N/
 .claude/agents/{slr-scoper,slr-manager,slr-worker,topic-coordinator,
   academic-paper-worker,academic-metadata-checker,technical-source-worker}.md
 .claude/skills/{slr-scoping,slr-topic-research}/SKILL.md
+.claude/templates/{paper-note,final-report}.md
 ```
 
 `SLR_STATE.json` records the initial topic, current status and revision,
@@ -367,6 +546,11 @@ Flags:
 - `--target-papers`, `--max-paper-candidates` — bounded academic search budgets
 - `--target-technical-sources`, `--max-technical-candidates` — bounded technical search budgets
 - `--max-correction-rounds` — bounded file-queue correction/recheck cycles
+- `--[no-]finalization` — enable/disable the final pipeline (enabled by default)
+- `--max-prefinal-repair-rounds` — bounded repair rounds, `0..3` (default: `1`)
+- `--[no-]allow-finalize-with-limitations` — control post-limit finalization
+- `--finalizer-timeout`, `--finalizer-retries` — bounded Manager Finalizer runs
+- `--[no-]allow-complete-with-warnings` — control warning-only completion
 
 Each round runs as: **manager plan pass → workers (parallel) → manager review pass**. The manager owns all control files and commits twice per round (`round-N-plan`, `round-N-review`). Workers write only to `topics/` and `assets/`.
 
@@ -442,6 +626,8 @@ slrharness/
 │   │   └── slr-worker.json         # Kiro/reference worker config
 │   └── skills/slr-scoping/
 │       └── SKILL.md                # Scoping best practices
+│   ├── templates/                  # Canonical paper/final report contracts
+│   └── config/example-config.yaml  # Key-free configuration reference
 ├── src/slrharness/
 │   ├── __init__.py
 │   ├── agent_backends.py           # Agent platform abstraction & registry
@@ -449,6 +635,12 @@ slrharness/
 │   ├── scope_workflow.py            # Scope state, revisions, approval gate
 │   ├── tmux_runner.py              # Parallel spawn + wait-for sync
 │   ├── workspace_assets.py          # Workspace agent/skill deployment
+│   ├── contracts.py                # Schema, path and atomic-write contracts
+│   ├── diagnostics.py              # Read-only doctor/project validation
+│   ├── project_lock.py             # Per-workspace writer lock
+│   ├── source_registry.py          # Validation, stable IDs and aggregation
+│   ├── finalization.py             # Audit, bounded repair, final validation
+│   ├── cli.py                      # Installed unified entry point
 │   └── scope.py                     # Scope lifecycle CLI + workspace init
 ├── tests/
 │   ├── test_init.py
@@ -462,8 +654,7 @@ slrharness/
 │       ├── SUMMARY.md              # Evolving synthesis
 │       ├── topics/                 # Worker output
 │       └── assets/                 # Supporting files
-├── docs/
-│   └── design.md                   # Full architecture document
+├── docs/                           # Architecture, contracts and development
 ├── SCOPE_TEMPLATE.md               # Copy-and-fill scope template
 ├── README.md                       # This file
 └── pyproject.toml
@@ -475,10 +666,35 @@ slrharness/
    explicitly approve the generated proposal; or explicitly initialize an
    already-approved scope. Python owns the approval gate and preserves the
    approved content as `SCOPE_ORIGINAL.md`.
-2. **Plan pass.** The manager agent reads the scope, reviews new files in `topics/`, updates `SUMMARY.md`, optionally evolves `SCOPE.md` (subject to invariants in the design doc), and writes pending tasks to `TASKS.md`.
+2. **Plan pass.** The manager reads the immutable approved scope and writes
+   bounded pending topic tasks. It cannot change approval or lifecycle state.
 3. **Worker dispatch.** The orchestrator parses `TASKS.md`, extracts up to `--num-workers` pending `- [ ]` lines, and launches each as an agent CLI session in its own tmux window. Workers signal completion via `tmux wait-for` channels.
 4. **Review pass.** The manager validates worker output, marks completed tasks `[x]`, updates `SUMMARY.md`, and commits.
-5. **Repeat** until `--max-rounds` reached, no pending tasks remain, or manager signals saturation.
+5. **Repeat and finalize.** Bounded additional rounds end in registry aggregation,
+   pre-final audit/optional repair, one canonical synthesis, validation, and COMPLETE.
+
+## Troubleshooting
+
+- `claude command not found`, login failures, missing Git/tmux, or missing packaged
+  agents/templates: run `slrharness doctor` and fix every hard requirement.
+- `agent not found`: rerun the command; workspace assets are deployed automatically.
+  Verify `.claude/agents/` rather than copying global files manually.
+- MCP disconnected, Scholar throttled, inaccessible pages, or missing Tavily key:
+  these are optional-capability warnings. Workers fall back and must write
+  limited-access/no-result records instead of claiming the literature is empty.
+- Waiting for Scope approval: inspect with `slrharness show --workspace ...`, then
+  revise or explicitly approve the printed revision.
+- Coordinator PARTIAL or unresolved metadata: inspect the adjacent manifest,
+  `task.json`, metadata audit, correction queue, and synthesis limitations; resume
+  `slrharness run` to complete only unfinished work.
+- Final validation failed: inspect `artifacts/audits/final_audit.json` and rerun
+  `slrharness finalize`; only the Finalizer is retried with those diagnostics.
+- Stale lock: confirm the PID recorded in `.git/.slrharness.lock` is not running,
+  then remove that exact file. Never recursively clean the workspace.
+- Resume appears idle: `slrharness status PROJECT` reports approval, pending tasks,
+  artifact errors, and finalization phase. COMPLETE projects intentionally do nothing.
+- Legacy project: validation warns about missing schemas/manifests but does not
+  rewrite or approve it. Use `legacy_worker` for historical topics.
 
 ## Development
 

@@ -16,6 +16,7 @@ CLAUDE_AGENT_FILES = (
     "technical-source-worker.md",
 )
 CLAUDE_SKILL_DIRS = ("slr-scoping", "slr-topic-research")
+CLAUDE_TEMPLATE_FILES = ("paper-note.md", "final-report.md")
 
 
 def _plugins_root() -> Path:
@@ -27,7 +28,17 @@ def _plugins_root() -> Path:
     return Path(str(bundled))
 
 
-def deploy_claude_assets(workspace: Path) -> list[Path]:
+def required_asset_sources() -> list[Path]:
+    """List every runtime asset that must exist in a checkout or wheel."""
+    root = _plugins_root()
+    return [
+        *(root / "agents" / name for name in CLAUDE_AGENT_FILES),
+        *(root / "skills" / name / "SKILL.md" for name in CLAUDE_SKILL_DIRS),
+        *(root / "templates" / name for name in CLAUDE_TEMPLATE_FILES),
+    ]
+
+
+def deploy_claude_assets(workspace: Path, *, overwrite: bool = True) -> list[Path]:
     """Copy required project-scoped agents and skill into ``workspace``."""
     source = _plugins_root()
     agents_dir = workspace / ".claude" / "agents"
@@ -39,7 +50,8 @@ def deploy_claude_assets(workspace: Path) -> list[Path]:
         if not src.is_file():
             raise FileNotFoundError(f"Bundled Claude agent is missing: {src}")
         dst = agents_dir / filename
-        shutil.copyfile(src, dst)
+        if overwrite or not dst.exists():
+            shutil.copyfile(src, dst)
         deployed.append(dst)
 
     for skill_name in CLAUDE_SKILL_DIRS:
@@ -48,6 +60,18 @@ def deploy_claude_assets(workspace: Path) -> list[Path]:
             raise FileNotFoundError(f"Bundled Claude skill is missing: {skill_src}")
         skill_dst = workspace / ".claude" / "skills" / skill_name / "SKILL.md"
         skill_dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(skill_src, skill_dst)
+        if overwrite or not skill_dst.exists():
+            shutil.copyfile(skill_src, skill_dst)
         deployed.append(skill_dst)
+    for filename in CLAUDE_TEMPLATE_FILES:
+        template_src = source / "templates" / filename
+        if not template_src.is_file():
+            raise FileNotFoundError(
+                f"Bundled Claude template is missing: {template_src}"
+            )
+        template_dst = workspace / ".claude" / "templates" / filename
+        template_dst.parent.mkdir(parents=True, exist_ok=True)
+        if overwrite or not template_dst.exists():
+            shutil.copyfile(template_src, template_dst)
+        deployed.append(template_dst)
     return deployed

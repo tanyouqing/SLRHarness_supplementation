@@ -12,6 +12,7 @@ def test_topic_agent_definitions_and_skill_are_deployed(tmp_path: Path) -> None:
     academic = (agents / "academic-paper-worker.md").read_text(encoding="utf-8")
     checker = (agents / "academic-metadata-checker.md").read_text(encoding="utf-8")
     technical = (agents / "technical-source-worker.md").read_text(encoding="utf-8")
+    manager = (agents / "slr-manager.md").read_text(encoding="utf-8")
     skill = (
         tmp_path / ".claude" / "skills" / "slr-topic-research" / "SKILL.md"
     ).read_text(encoding="utf-8")
@@ -25,6 +26,8 @@ def test_topic_agent_definitions_and_skill_are_deployed(tmp_path: Path) -> None:
     assert "mcp__tavily__*" in technical
     assert "mcp__tavily__*" not in academic
     assert "TAVILY_API_KEY=" not in coordinator + academic + checker + technical
+    assert "WebSearch" not in manager
+    assert "add an unregistered paper" in manager
     assert "Evidence ID" in skill
     assert "correction_requests.jsonl" in skill
     assert "coordinator_manifest.json" in skill

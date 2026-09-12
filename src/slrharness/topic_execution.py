@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from slrharness.contracts import SCHEMA_VERSION, check_schema_version
+
 LEGACY_WORKER = "legacy_worker"
 TOPIC_COORDINATOR = "topic_coordinator"
 TOPIC_EXECUTION_MODES = (LEGACY_WORKER, TOPIC_COORDINATOR)
@@ -63,6 +65,20 @@ class TopicExecutionConfig:
             )
         if self.coordinator_retries < 0:
             raise ValueError("coordinator_retries must be non-negative")
+        if self.coordinator_retries > 5 or self.max_correction_rounds > 5:
+            raise ValueError("topic retries and correction rounds must not exceed 5")
+        if self.coordinator_timeout_seconds > 86400 or self.message_wait_seconds > 3600:
+            raise ValueError("topic timeout exceeds the v1 safety limit")
+        if (
+            max(
+                self.coordinator_max_turns,
+                self.academic_max_turns,
+                self.metadata_max_turns,
+                self.technical_max_turns,
+            )
+            > 200
+        ):
+            raise ValueError("agent max turns must not exceed 200")
         for value in (
             self.target_papers,
             self.max_paper_candidates,
@@ -71,6 +87,8 @@ class TopicExecutionConfig:
         ):
             if value < 0:
                 raise ValueError("Topic search targets must be non-negative")
+            if value > 1000:
+                raise ValueError("Topic search targets exceed the v1 safety limit")
 
 
 @dataclass(frozen=True)
@@ -156,7 +174,7 @@ def initialize_topic_attempt(
     for directory in (paths.paper_dir, paths.technical_dir, paths.audit_dir):
         directory.mkdir(parents=True, exist_ok=True)
     state = {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "task_id": paths.task_id,
         "topic_path": paths.topic_path,
         "description": description,
@@ -268,6 +286,7 @@ OUTER/INNER BOUNDARY:
   checker {config.metadata_max_turns}. Never wait or revise indefinitely.
 
 ACADEMIC WORK CONTRACT:
+- Every included note follows `{workspace / ".claude/templates/paper-note.md"}`.
 - Soft target {config.target_papers} included papers from at most
   {config.max_paper_candidates} initial candidates.
 - Bounded backward citation search: {config.enable_backward_citation_search}.
@@ -305,6 +324,7 @@ REQUIRED FINAL OUTPUTS:
   academic_worker.index_path and paper_count,
   metadata_checker.audit_path and overall_status,
   technical_worker.index_path and source_count, limitations, and completed_at.
+- Every JSON artifact above must include `"schema_version": "1.0"`.
 
 MCP AND NETWORK FALLBACK:
 - Academic and metadata roles prefer configured scholarly/arXiv tools, then
@@ -403,6 +423,9 @@ def validate_coordinator_outputs(
     manifest = _load_json(paths.manifest, "coordinator manifest", errors)
     if manifest is None:
         return CoordinatorValidation(False, "FAILED", tuple(errors), tuple(warnings))
+    schema_errors, schema_warnings = check_schema_version(manifest, "manifest")
+    errors.extend(schema_errors)
+    warnings.extend(schema_warnings)
     if manifest.get("task_id") != paths.task_id:
         errors.append(
             f"manifest task_id mismatch: expected {paths.task_id}, "
@@ -420,6 +443,56 @@ def validate_coordinator_outputs(
         errors.append("coordinator manifest reports FAILED")
     elif status == "PARTIAL" and not allow_partial:
         errors.append("PARTIAL completion is disabled")
+    if correction_queue.is_file():
+        latest_requests: dict[str, dict[str, Any]] = {}
+        seen_pending: set[tuple[str, str, str]] = set()
+        for line_number, line in enumerate(
+            correction_queue.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if not line.strip():
+                continue
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError:
+                errors.append(f"invalid correction request JSON on line {line_number}")
+                continue
+            request_id = str(request.get("request_id") or "")
+            request_status = str(request.get("status") or "").lower()
+            if not request_id or request_status not in {
+                "pending",
+                "resolved",
+                "unresolved",
+            }:
+                errors.append(f"invalid correction request on line {line_number}")
+                continue
+            signature = (
+                request_id,
+                str(request.get("note_path") or ""),
+                str(request.get("field") or ""),
+            )
+            if request_status == "pending" and signature in seen_pending:
+                warnings.append(f"duplicate pending correction request: {request_id}")
+            seen_pending.add(signature)
+            latest_requests[request_id] = request
+        pending_requests = [
+            request_id
+            for request_id, request in latest_requests.items()
+            if str(request.get("status")).lower() == "pending"
+        ]
+        if pending_requests:
+            message = f"unresolved correction requests: {sorted(pending_requests)}"
+            if status == "COMPLETE" or not allow_partial:
+                errors.append(message)
+            else:
+                warnings.append(message)
+        if isinstance(config, TopicExecutionConfig):
+            rounds = [
+                int(request.get("round", 0))
+                for request in latest_requests.values()
+                if str(request.get("round", "")).isdigit()
+            ]
+            if rounds and max(rounds) > config.max_correction_rounds:
+                errors.append("correction request exceeds max_correction_rounds")
 
     synthesis_path = _resolve_manifest_path(workspace, manifest.get("topic_synthesis"))
     if synthesis_path != paths.synthesis.resolve():
@@ -456,6 +529,10 @@ def validate_coordinator_outputs(
     )
     if paper_data and paper_data.get("task_id") != paths.task_id:
         errors.append("paper index task_id mismatch")
+    if paper_data:
+        schema_errors, schema_warnings = check_schema_version(paper_data, "paper index")
+        errors.extend(schema_errors)
+        warnings.extend(schema_warnings)
     if paper_index and paper_index.suffix.lower() != ".json":
         no_result = paths.paper_dir / "NO_RESULTS.md"
         if paper_index != no_result.resolve():
@@ -467,6 +544,12 @@ def validate_coordinator_outputs(
     )
     if technical_data and technical_data.get("task_id") != paths.task_id:
         errors.append("technical index task_id mismatch")
+    if technical_data:
+        schema_errors, schema_warnings = check_schema_version(
+            technical_data, "technical source index"
+        )
+        errors.extend(schema_errors)
+        warnings.extend(schema_warnings)
     if technical_index and technical_index.suffix.lower() != ".json":
         no_result = paths.technical_dir / "NO_RESULTS.md"
         if technical_index != no_result.resolve():
@@ -474,6 +557,10 @@ def validate_coordinator_outputs(
     audit = _load_json(audit_path, "metadata audit", errors) if audit_path else None
     if audit and audit.get("task_id") != paths.task_id:
         errors.append("metadata audit task_id mismatch")
+    if audit:
+        schema_errors, schema_warnings = check_schema_version(audit, "metadata audit")
+        errors.extend(schema_errors)
+        warnings.extend(schema_warnings)
 
     manifest_paper_count = _manifest_nested(manifest, "academic_worker", "paper_count")
     index_paper_count = paper_data.get("paper_count") if paper_data else 0
@@ -603,7 +690,12 @@ def validate_coordinator_outputs(
                 ):
                     errors.append(f"invalid technical note path: {note_value!r}")
 
-    effective_status = "PARTIAL" if warnings or status == "PARTIAL" else status
+    substantive_warnings = [
+        warning for warning in warnings if "schema_version" not in warning
+    ]
+    effective_status = (
+        "PARTIAL" if substantive_warnings or status == "PARTIAL" else status
+    )
     if warnings and not allow_partial:
         errors.extend(warnings)
     accepted = not errors and effective_status in ("COMPLETE", "PARTIAL")

@@ -17,6 +17,12 @@ from slrharness.agent_backends import (
     AgentExecutionResult,
     execute_agent,
 )
+from slrharness.contracts import (
+    SCHEMA_VERSION,
+    atomic_write_json,
+    atomic_write_text,
+    check_schema_version,
+)
 from slrharness.workspace_assets import deploy_claude_assets
 
 STATE_FILENAME = "SLR_STATE.json"
@@ -30,6 +36,19 @@ AWAITING_SCOPE_APPROVAL = "AWAITING_SCOPE_APPROVAL"
 SCOPE_APPROVED = "SCOPE_APPROVED"
 SCOPE_REJECTED = "SCOPE_REJECTED"
 SCOPE_REVISION_REQUESTED = "SCOPE_REVISION_REQUESTED"
+
+SCOPE_TRANSITIONS = {
+    SCOPE_NOT_STARTED: {SCOPE_PREPARING},
+    SCOPE_PREPARING: {AWAITING_SCOPE_APPROVAL, SCOPE_REVISION_REQUESTED},
+    AWAITING_SCOPE_APPROVAL: {
+        SCOPE_APPROVED,
+        SCOPE_REJECTED,
+        SCOPE_REVISION_REQUESTED,
+    },
+    SCOPE_REJECTED: {SCOPE_REVISION_REQUESTED},
+    SCOPE_REVISION_REQUESTED: {SCOPE_PREPARING},
+    SCOPE_APPROVED: set(),
+}
 
 WORKSPACE_GITIGNORE = """\
 # Workspace .gitignore
@@ -89,6 +108,8 @@ class ScopeConfig:
     def __post_init__(self) -> None:
         if self.target_surveys < 0 or self.max_initial_candidates < 0:
             raise ValueError("Scope search targets must be non-negative")
+        if self.target_surveys > 100 or self.max_initial_candidates > 1000:
+            raise ValueError("Scope search targets exceed v1 safety limits")
         if self.minimum_successful_surveys != 0:
             raise ValueError("minimum_successful_surveys must remain 0")
 
@@ -102,6 +123,13 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def require_scope_transition(current: object, target: str) -> None:
+    if target == current:
+        return
+    if target not in SCOPE_TRANSITIONS.get(str(current), set()):
+        raise ValueError(f"Illegal scope transition: {current!r} -> {target!r}")
+
+
 def state_path(workspace: Path) -> Path:
     return workspace / STATE_FILENAME
 
@@ -113,25 +141,22 @@ def load_scope_state(workspace: Path) -> dict[str, object]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"Invalid scope state: {path}")
+    errors, _ = check_schema_version(data, "project state")
+    if errors:
+        raise ValueError("; ".join(errors))
     return data
 
 
 def save_scope_state(workspace: Path, state: dict[str, object]) -> None:
     """Atomically persist harness-owned state."""
-    path = state_path(workspace)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(state, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    atomic_write_json(state_path(workspace), state)
 
 
 def _new_state(
     topic: str, config: ScopeConfig, theme: str | None = None
 ) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "status": SCOPE_NOT_STARTED,
         "theme": theme or topic,
         "initial_topic": topic,
@@ -414,6 +439,7 @@ def run_scope_preparation(
         raise ValueError(f"Cannot prepare scope from status {status!r}")
 
     expected = deepcopy(state)
+    require_scope_transition(status, SCOPE_PREPARING)
     expected.update(
         {
             "status": SCOPE_PREPARING,
@@ -482,6 +508,7 @@ def run_scope_preparation(
 
     _archive_revision(workspace, revision)
     generated_at = utc_now()
+    require_scope_transition(SCOPE_PREPARING, AWAITING_SCOPE_APPROVAL)
     expected.update(
         {
             "status": AWAITING_SCOPE_APPROVAL,
@@ -515,6 +542,7 @@ def request_scope_revision(workspace: Path, feedback: str) -> int:
     feedback = feedback.strip()
     if not feedback:
         raise ValueError("Revision feedback must not be empty")
+    require_scope_transition(state.get("status"), SCOPE_REVISION_REQUESTED)
     next_revision = int(state["revision"]) + 1
     feedback_history = list(state.get("feedback_history", []))
     feedback_history.append(
@@ -557,20 +585,17 @@ def approve_scope(workspace: Path, revision: int) -> bool:
         raise ValueError(
             f"Revision mismatch: current proposal is {current}, requested {revision}"
         )
+    require_scope_transition(state.get("status"), SCOPE_APPROVED)
     errors = _validate_scope_outputs(workspace)
     if errors:
         raise ValueError("Cannot approve invalid proposal: " + "; ".join(errors))
 
     proposal = (workspace / PROPOSAL_FILENAME).read_text(encoding="utf-8")
-    (workspace / "SCOPE.md").write_text(proposal, encoding="utf-8")
-    (workspace / "SCOPE_ORIGINAL.md").write_text(proposal, encoding="utf-8")
+    atomic_write_text(workspace / "SCOPE.md", proposal)
+    atomic_write_text(workspace / "SCOPE_ORIGINAL.md", proposal)
     theme = str(state.get("theme", state["initial_topic"]))
-    (workspace / "TASKS.md").write_text(
-        EMPTY_TASKS_MD.format(theme=theme), encoding="utf-8"
-    )
-    (workspace / "SUMMARY.md").write_text(
-        EMPTY_SUMMARY_MD.format(theme=theme), encoding="utf-8"
-    )
+    atomic_write_text(workspace / "TASKS.md", EMPTY_TASKS_MD.format(theme=theme))
+    atomic_write_text(workspace / "SUMMARY.md", EMPTY_SUMMARY_MD.format(theme=theme))
     (workspace / "topics").mkdir()
     (workspace / "assets").mkdir()
     (workspace / "topics" / ".gitkeep").touch()
@@ -606,6 +631,7 @@ def reject_scope(workspace: Path, revision: int) -> bool:
         raise ValueError(
             f"Revision mismatch: current proposal is {current}, requested {revision}"
         )
+    require_scope_transition(state.get("status"), SCOPE_REJECTED)
     history = list(state.get("history", []))
     history.append({"at": utc_now(), "event": "scope_rejected", "revision": revision})
     state.update(

@@ -10,6 +10,7 @@ The manager is the sole owner of control files and git commits.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -17,7 +18,8 @@ import subprocess
 import sys
 import textwrap
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 from slrharness.agent_backends import (
@@ -26,6 +28,22 @@ from slrharness.agent_backends import (
     available_backends,
     get_backend,
 )
+from slrharness.contracts import SCHEMA_VERSION, atomic_write_json
+from slrharness.finalization import (
+    FINAL_AUDIT_PATH,
+    PREFINAL_AUDIT_PATH,
+    FinalizationConfig,
+    aggregate_and_audit,
+    build_finalizer_prompt,
+    build_prefinal_prompt,
+    build_repair_plan_prompt,
+    ensure_stable_repair_tasks,
+    finalization_state,
+    update_finalization_state,
+    validate_final_report,
+    validate_prefinal_audit,
+)
+from slrharness.project_lock import ProjectLock, ProjectLockedError
 from slrharness.scope_workflow import (
     formal_research_block_reason,
     load_scope_state,
@@ -50,6 +68,7 @@ from slrharness.topic_execution import (
     topic_paths,
     validate_coordinator_outputs,
 )
+from slrharness.workspace_assets import deploy_claude_assets
 
 DEFAULT_MAX_ROUNDS = 5
 DEFAULT_NUM_WORKERS = 3
@@ -220,13 +239,9 @@ def build_manager_prompt(workspace: Path, round_num: int, phase: str) -> str:
 
         CRITICAL INVARIANTS (non-negotiable):
         1. SCOPE_ORIGINAL.md is READ-ONLY. Never modify it.
-        2. Before changing SCOPE.md, re-read SCOPE_ORIGINAL.md and verify:
-           - The research question is preserved verbatim
-           - All original inclusion/exclusion criteria remain present
-           - All original comparison dimensions remain (new ones may be appended)
-           - Original ranking & grouping criteria remain intact
-           - Log any additions in a `## Scope Evolution Log` section at the bottom
-        3. You OWN TASKS.md, SUMMARY.md, and SCOPE.md. Workers never touch these.
+        2. SCOPE.md is the canonical approved scope and is READ-ONLY. Record any
+           proposed future scope change as a non-binding note; never edit it.
+        3. You OWN TASKS.md and SUMMARY.md. Workers never touch these.
         4. You never search databases directly -- that is workers' job.
         5. SUMMARY.md must be organized per the ranking & grouping criteria in
            SCOPE.md. Items must appear in the order those criteria dictate.
@@ -234,7 +249,7 @@ def build_manager_prompt(workspace: Path, round_num: int, phase: str) -> str:
 
         Workspace files:
         - SCOPE_ORIGINAL.md (immutable baseline)
-        - SCOPE.md (living scope, includes ranking & grouping criteria)
+        - SCOPE.md (canonical approved scope; immutable during formal research)
         - TASKS.md (task registry, checkbox format)
         - SUMMARY.md (evolving synthesis with comparison tables)
         - topics/ (READ ONLY). A TASKS entry `topics/x/y` has exactly one
@@ -258,9 +273,9 @@ def build_manager_prompt(workspace: Path, round_num: int, phase: str) -> str:
                maintaining the ranking & grouping order defined in SCOPE.md.
                When workers extracted ranking scores in their `## Ranking Scores`
                section, use those scores (recompute the composite if defined).
-            4. If workers proposed new comparison dimensions (in their
-               "## Proposed Additions" sections), consider them and -- if valid --
-               append to SCOPE.md (respecting invariants above).
+            4. If workers propose new comparison dimensions, use only those
+               already covered by the approved scope; record broader ideas as
+               future work without editing SCOPE.md.
             5. Plan which pending tasks should run this round. Leave them as
                `- [ ]` in TASKS.md; the orchestrator will pick them up.
             6. Run:
@@ -449,6 +464,14 @@ def run_manager(
     Returns True if the manager completed within the timeout.
     """
     prompt = build_manager_prompt(workspace, round_num, phase)
+    protected_paths = [
+        workspace / "SLR_STATE.json",
+        workspace / "SCOPE.md",
+        workspace / "SCOPE_ORIGINAL.md",
+    ]
+    protected = {
+        path: path.read_bytes() if path.is_file() else None for path in protected_paths
+    }
     command = backend.build_command("slr-manager", prompt, cwd=workspace)
     status_path = _agent_status_path(workspace, f"manager-round-{round_num}-{phase}")
 
@@ -464,6 +487,7 @@ def run_manager(
     completed = results[spec.window_name]
     output = capture_pane(MANAGER_SESSION, spec.window_name)
     kill_session(MANAGER_SESSION)
+    _restore_protected_paths(protected)
     exit_code = _read_agent_exit_code(status_path)
     if not completed or exit_code != 0:
         print(
@@ -472,7 +496,77 @@ def run_manager(
         )
         if output.strip():
             print(output.rstrip())
+    _write_agent_run_record(
+        workspace,
+        f"manager-round-{round_num}-{phase}",
+        "slr-manager",
+        prompt,
+        timeout,
+        completed,
+        exit_code,
+        output,
+    )
     return completed and exit_code == 0
+
+
+def run_named_agent(
+    workspace: Path,
+    agent_name: str,
+    prompt: str,
+    run_name: str,
+    timeout: int,
+    backend: AgentBackend,
+) -> bool:
+    """Run one named top-level agent with captured status and bounded waiting."""
+    protected_paths = [
+        workspace / "SLR_STATE.json",
+        workspace / "SCOPE.md",
+        workspace / "SCOPE_ORIGINAL.md",
+    ]
+    protected = {
+        path: path.read_bytes() if path.is_file() else None for path in protected_paths
+    }
+    command = backend.build_command(agent_name, prompt, cwd=workspace)
+    status_path = _agent_status_path(workspace, run_name)
+    spec = WorkerSpec(
+        window_name=run_name[:40],
+        command=command,
+        done_channel=f"{run_name}-done",
+        cwd=workspace,
+        exit_status_path=status_path,
+    )
+    spawn_workers(MANAGER_SESSION, [spec])
+    completed = wait_for_all([spec], timeout=timeout)[spec.window_name]
+    output = capture_pane(MANAGER_SESSION, spec.window_name)
+    kill_session(MANAGER_SESSION)
+    _restore_protected_paths(protected)
+    exit_code = _read_agent_exit_code(status_path)
+    if not completed or exit_code != 0:
+        print(
+            f"Agent {agent_name} failed (completed={completed}, exit_code={exit_code})."
+        )
+        if output.strip():
+            print(output.rstrip())
+    _write_agent_run_record(
+        workspace,
+        run_name,
+        agent_name,
+        prompt,
+        timeout,
+        completed,
+        exit_code,
+        output,
+    )
+    return completed and exit_code == 0
+
+
+def _restore_protected_paths(protected: dict[Path, bytes | None]) -> None:
+    """Undo any attempted Agent write to program-owned state/scope files."""
+    for path, original in protected.items():
+        if original is None:
+            path.unlink(missing_ok=True)
+        elif not path.is_file() or path.read_bytes() != original:
+            path.write_bytes(original)
 
 
 def run_workers(
@@ -733,6 +827,40 @@ def _read_agent_exit_code(path: Path | None) -> int | None:
         return None
 
 
+def _write_agent_run_record(
+    workspace: Path,
+    run_name: str,
+    agent_name: str,
+    prompt: str,
+    timeout: int,
+    completed: bool,
+    exit_code: int | None,
+    output: str,
+) -> None:
+    """Persist bounded, secret-minimizing invocation metadata under .git/."""
+    path = workspace / ".git" / "slrharness-runs" / f"{run_name}.json"
+    atomic_write_json(
+        path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "run_name": run_name,
+            "agent": agent_name,
+            "recorded_at": datetime.now(UTC).isoformat(),
+            "timeout_seconds": timeout,
+            "completed_signal": completed,
+            "exit_code": exit_code,
+            "artifact_validation_passed": None,
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "prompt_characters": len(prompt),
+            "output_tail": re.sub(
+                r"(?i)(?:api[_-]?key|token|authorization)\s*[:=]\s*\S+",
+                "[REDACTED]",
+                output[-20000:],
+            ),
+        },
+    )
+
+
 def print_status(workspace: Path) -> None:
     """Print a concise status summary of the workspace."""
     if not (workspace / ".git").is_dir():
@@ -764,6 +892,10 @@ def print_status(workspace: Path) -> None:
         scope_state = load_scope_state(workspace)
         print(f"  Scope status: {scope_state.get('status')}")
         print(f"  Scope revision: {scope_state.get('revision')}")
+        final_state = scope_state.get("finalization")
+        if isinstance(final_state, dict):
+            print(f"  Finalization phase: {final_state.get('phase')}")
+            print(f"  Repair rounds used: {final_state.get('repair_rounds_used', 0)}")
     print(f"  Last completed round: {last_round}")
     print(f"  Next round (if you run): {last_round + 1}")
     print(f"  Git working tree: {'clean' if clean else 'DIRTY (uncommitted changes)'}")
@@ -851,7 +983,297 @@ def _verify_phase_committed(
     return agent_ok
 
 
-def run_slr(
+def _commit_finalization_artifacts(workspace: Path, message: str) -> None:
+    """Commit program-owned state/audits so every resume starts cleanly."""
+    if is_workspace_clean(workspace):
+        return
+    subprocess.run(["git", "add", "-A"], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "-m", message], cwd=workspace, check=True)
+
+
+def _run_repair_tasks(
+    workspace: Path,
+    tasks: list[Task],
+    round_num: int,
+    num_workers: int,
+    topic_config: TopicExecutionConfig,
+    backend: AgentBackend,
+) -> dict[str, bool]:
+    """Execute bounded repair tasks through the existing coordinator pipeline."""
+    results: dict[str, bool] = {}
+    repair_config = replace(topic_config, mode=TOPIC_COORDINATOR)
+    for start in range(0, len(tasks), num_workers):
+        batch = tasks[start : start + num_workers]
+        results.update(
+            run_topic_coordinators(workspace, batch, round_num, repair_config, backend)
+        )
+    return results
+
+
+def run_finalization_pipeline(
+    workspace: Path,
+    round_num: int,
+    num_workers: int,
+    manager_timeout: int,
+    backend: AgentBackend,
+    topic_config: TopicExecutionConfig,
+    config: FinalizationConfig,
+) -> bool:
+    """Aggregate, audit, optionally repair once, finalize, and validate."""
+    if not config.enabled:
+        return True
+    deploy_claude_assets(workspace, overwrite=False)
+    prior = finalization_state(workspace)
+    if prior.get("phase") == "COMPLETE":
+        validation = validate_final_report(workspace, config)
+        if validation.accepted:
+            print("Final report is already complete; resume skipped regeneration.")
+            _commit_finalization_artifacts(
+                workspace, "finalization: refresh deterministic final audit"
+            )
+            return True
+
+    update_finalization_state(
+        workspace, "TOPIC_RESEARCH_COMPLETE", config, last_round=round_num
+    )
+    registry, audit = aggregate_and_audit(workspace, config)
+    _commit_finalization_artifacts(workspace, "finalization: aggregate sources")
+
+    if config.enable_prefinal_audit:
+        semantic_ok = run_named_agent(
+            workspace,
+            config.finalizer_agent,
+            build_prefinal_prompt(workspace),
+            "manager-prefinal-audit",
+            manager_timeout,
+            backend,
+        )
+        audit_ok, audit_errors = validate_prefinal_audit(workspace)
+        if not semantic_ok or not audit_ok:
+            update_finalization_state(
+                workspace,
+                "AWAITING_INTERVENTION",
+                config,
+                failure="; ".join(audit_errors or ["pre-final audit agent failed"]),
+            )
+            _commit_finalization_artifacts(
+                workspace, "finalization: record pre-final audit failure"
+            )
+            return False
+        audit = json.loads(
+            (workspace / PREFINAL_AUDIT_PATH).read_text(encoding="utf-8")
+        )
+        _commit_finalization_artifacts(workspace, "finalization: pre-final audit")
+
+    final_state = finalization_state(workspace)
+    repairs_used = int(final_state.get("repair_rounds_used", 0))
+    if (
+        audit.get("repair_required")
+        and repairs_used < config.max_prefinal_repair_rounds
+    ):
+        update_finalization_state(workspace, "GAP_REPAIR_PLANNED", config)
+        repair_plan_ok = run_named_agent(
+            workspace,
+            config.finalizer_agent,
+            build_repair_plan_prompt(workspace, round_num + 1),
+            "manager-gap-repair-plan",
+            manager_timeout,
+            backend,
+        )
+        if not repair_plan_ok:
+            update_finalization_state(
+                workspace,
+                "AWAITING_INTERVENTION",
+                config,
+                failure="gap-repair planning failed",
+            )
+            _commit_finalization_artifacts(
+                workspace, "finalization: record repair-plan failure"
+            )
+            return False
+        ensure_stable_repair_tasks(workspace, audit)
+        if not _verify_phase_committed(
+            workspace, round_num + 1, "gap-repair-plan", repair_plan_ok
+        ):
+            update_finalization_state(
+                workspace,
+                "AWAITING_INTERVENTION",
+                config,
+                failure="gap-repair plan was not committed",
+            )
+            _commit_finalization_artifacts(
+                workspace, "finalization: record uncommitted repair plan"
+            )
+            return False
+        repair_ids = {
+            str(gap.get("gap_id"))
+            for gap in audit.get("recommended_repairs", [])
+            if isinstance(gap, dict) and gap.get("blocking") is True
+        }
+        repair_tasks = [
+            task
+            for task in parse_pending_tasks(workspace / "TASKS.md")
+            if any(gap_id in task.description for gap_id in repair_ids)
+        ]
+        if repair_tasks:
+            repairs_used += 1
+            update_finalization_state(
+                workspace,
+                "GAP_REPAIR_RUNNING",
+                config,
+                repair_rounds_used=repairs_used,
+            )
+            repair_results = _run_repair_tasks(
+                workspace,
+                repair_tasks,
+                round_num + 1,
+                num_workers,
+                topic_config,
+                backend,
+            )
+            print(
+                f"Gap repair: {sum(repair_results.values())}/"
+                f"{len(repair_results)} topic tasks completed."
+            )
+            review_ok = run_manager(
+                workspace, round_num + 1, "review", manager_timeout, backend
+            )
+            if not _verify_phase_committed(
+                workspace, round_num + 1, "gap-repair-review", review_ok
+            ):
+                update_finalization_state(
+                    workspace,
+                    "AWAITING_INTERVENTION",
+                    config,
+                    failure="gap-repair review failed",
+                )
+                _commit_finalization_artifacts(
+                    workspace, "finalization: record repair-review failure"
+                )
+                return False
+            tag_round(workspace, round_num + 1)
+            registry, audit = aggregate_and_audit(workspace, config)
+            _commit_finalization_artifacts(
+                workspace, "finalization: rebuild sources after repair"
+            )
+            if config.enable_prefinal_audit:
+                reaudit_agent_ok = run_named_agent(
+                    workspace,
+                    config.finalizer_agent,
+                    build_prefinal_prompt(workspace),
+                    "manager-prefinal-reaudit",
+                    manager_timeout,
+                    backend,
+                )
+                audit_ok, audit_errors = validate_prefinal_audit(workspace)
+                if reaudit_agent_ok and audit_ok:
+                    audit = json.loads(
+                        (workspace / PREFINAL_AUDIT_PATH).read_text(encoding="utf-8")
+                    )
+                else:
+                    update_finalization_state(
+                        workspace,
+                        "AWAITING_INTERVENTION",
+                        config,
+                        failure="; ".join(
+                            audit_errors or ["pre-final re-audit agent failed"]
+                        ),
+                    )
+                    _commit_finalization_artifacts(
+                        workspace, "finalization: record re-audit failure"
+                    )
+                    return False
+                _commit_finalization_artifacts(
+                    workspace, "finalization: pre-final audit after repair"
+                )
+        else:
+            update_finalization_state(
+                workspace,
+                "AWAITING_INTERVENTION",
+                config,
+                failure="pre-final audit required repair but produced no repair task",
+            )
+            _commit_finalization_artifacts(
+                workspace, "finalization: missing repair task"
+            )
+            return False
+
+    if audit.get("status") == "FAILED" and not config.allow_finalize_with_limitations:
+        update_finalization_state(
+            workspace,
+            "AWAITING_INTERVENTION",
+            config,
+            failure="pre-final audit blocks finalization",
+        )
+        _commit_finalization_artifacts(workspace, "finalization: blocked")
+        return False
+
+    update_finalization_state(
+        workspace,
+        "READY_FOR_FINAL_SYNTHESIS",
+        config,
+        source_counts={
+            "papers": len(registry.get("papers", [])),
+            "technical_sources": len(registry.get("technical_sources", [])),
+        },
+    )
+    diagnostics: list[str] = []
+    for attempt in range(1, config.finalizer_retries + 2):
+        report = workspace / config.canonical_report
+        if report.is_file():
+            drafts = workspace / "artifacts" / "final_drafts"
+            drafts.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(report, drafts / f"SUMMARY.before-attempt-{attempt}.md")
+        update_finalization_state(
+            workspace,
+            "FINAL_SYNTHESIS_RUNNING",
+            config,
+            finalizer_attempt=attempt,
+            validation_diagnostics=diagnostics,
+        )
+        finalizer_ok = run_named_agent(
+            workspace,
+            config.finalizer_agent,
+            build_finalizer_prompt(workspace, config, diagnostics),
+            f"manager-finalize-{attempt}",
+            config.finalizer_timeout_seconds,
+            backend,
+        )
+        update_finalization_state(
+            workspace, "FINAL_VALIDATION", config, finalizer_attempt=attempt
+        )
+        validation = validate_final_report(workspace, config)
+        diagnostics = [*validation.errors, *validation.warnings]
+        if not finalizer_ok:
+            diagnostics.insert(0, "finalizer process failed or timed out")
+        if finalizer_ok and validation.accepted:
+            update_finalization_state(
+                workspace,
+                "COMPLETE",
+                config,
+                finalizer_attempt=attempt,
+                final_audit=FINAL_AUDIT_PATH,
+                completed_at=validation.audit["generated_at"],
+            )
+            _commit_finalization_artifacts(
+                workspace, "finalization: validate canonical report"
+            )
+            return True
+        _commit_finalization_artifacts(
+            workspace, f"finalization: preserve failed finalizer attempt {attempt}"
+        )
+
+    update_finalization_state(
+        workspace,
+        "AWAITING_INTERVENTION",
+        config,
+        failure="; ".join(diagnostics),
+    )
+    _commit_finalization_artifacts(workspace, "finalization: intervention required")
+    return False
+
+
+def _run_slr_unlocked(
     workspace: Path,
     max_rounds: int,
     num_workers: int,
@@ -860,6 +1282,7 @@ def run_slr(
     backend: AgentBackend,
     allow_dirty: bool = False,
     topic_config: TopicExecutionConfig | None = None,
+    finalization_config: FinalizationConfig | None = None,
 ) -> None:
     """Execute the manager-worker loop.
 
@@ -896,6 +1319,7 @@ def run_slr(
         )
 
     topic_config = topic_config or TopicExecutionConfig()
+    finalization_config = finalization_config or FinalizationConfig()
     last_round = current_round(workspace)
     start_round = last_round + 1
     end_round = start_round + max_rounds  # exclusive
@@ -926,8 +1350,18 @@ def run_slr(
         # Extract pending tasks after the plan pass
         pending = parse_pending_tasks(tasks_md)
         if not pending:
-            print(f"[round {round_num}] No pending tasks. Review complete.")
-            tag_round(workspace, round_num)
+            print(f"[round {round_num}] No pending tasks. Starting finalization.")
+            finalized = run_finalization_pipeline(
+                workspace,
+                round_num,
+                num_workers,
+                manager_timeout,
+                backend,
+                topic_config,
+                finalization_config,
+            )
+            if finalized:
+                tag_round(workspace, round_num)
             break
 
         tasks_this_round = pending[:num_workers]
@@ -979,8 +1413,50 @@ def run_slr(
         print(f"[round {round_num}] Complete. Tagged round-{round_num}.")
         print()
 
+        if not parse_pending_tasks(tasks_md):
+            print(f"[round {round_num}] Topic research complete. Finalizing...")
+            run_finalization_pipeline(
+                workspace,
+                round_num,
+                num_workers,
+                manager_timeout,
+                backend,
+                topic_config,
+                finalization_config,
+            )
+            break
+
     print("Orchestration complete.")
     print(f"View history: cd {workspace} && git log --oneline")
+
+
+def run_slr(
+    workspace: Path,
+    max_rounds: int,
+    num_workers: int,
+    worker_timeout: int,
+    manager_timeout: int,
+    backend: AgentBackend,
+    allow_dirty: bool = False,
+    topic_config: TopicExecutionConfig | None = None,
+    finalization_config: FinalizationConfig | None = None,
+) -> None:
+    """Run or resume while refusing a second writer for this workspace."""
+    try:
+        with ProjectLock(workspace):
+            _run_slr_unlocked(
+                workspace,
+                max_rounds,
+                num_workers,
+                worker_timeout,
+                manager_timeout,
+                backend,
+                allow_dirty,
+                topic_config,
+                finalization_config,
+            )
+    except ProjectLockedError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _add_run_args(parser: argparse.ArgumentParser) -> None:
@@ -1060,6 +1536,25 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-technical-candidates", type=int, default=15)
     parser.add_argument("--max-correction-rounds", type=int, default=2)
     parser.add_argument(
+        "--finalization",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run source aggregation, audits, and final synthesis (default: enabled).",
+    )
+    parser.add_argument("--max-prefinal-repair-rounds", type=int, default=1)
+    parser.add_argument(
+        "--allow-finalize-with-limitations",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--finalizer-timeout", type=int, default=1800)
+    parser.add_argument("--finalizer-retries", type=int, default=1)
+    parser.add_argument(
+        "--allow-complete-with-warnings",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
         "--agent-backend",
         default=DEFAULT_BACKEND,
         choices=available_backends(),
@@ -1084,7 +1579,7 @@ def main(argv: list[str] | None = None) -> None:
     # Route to the right subparser. If the first token is a known subcommand
     # name, strip it and use that subparser; otherwise default to "run".
     subcommand = "run"
-    if argv and argv[0] in ("run", "status"):
+    if argv and argv[0] in ("run", "status", "finalize"):
         subcommand = argv[0]
         argv = argv[1:]
 
@@ -1103,16 +1598,25 @@ def main(argv: list[str] | None = None) -> None:
         print_status(args.workspace.resolve())
         return
 
-    # "run" subcommand (also the default for back-compat)
+    # "run" and explicit "finalize" (run remains the default for back-compat)
     parser = argparse.ArgumentParser(
-        prog="slrharness.orchestrator run",
+        prog=f"slrharness.orchestrator {subcommand}",
         description=(
-            "Run or resume the SLRHarness manager-worker loop. Re-running "
+            "Finalize an existing reviewed workspace."
+            if subcommand == "finalize"
+            else "Run or resume the SLRHarness manager-worker loop. Re-running "
             "the same workspace continues from the last completed round."
         ),
     )
     _add_run_args(parser)
     args = parser.parse_args(argv)
+
+    if not 1 <= args.max_rounds <= 100:
+        parser.error("--max-rounds must be between 1 and 100")
+    if not 1 <= args.num_workers <= 32:
+        parser.error("--num-workers must be between 1 and 32")
+    if args.worker_timeout <= 0 or args.manager_timeout <= 0:
+        parser.error("worker and manager timeouts must be positive")
 
     backend = get_backend(args.agent_backend)
     check_common_dependencies()
@@ -1129,10 +1633,38 @@ def main(argv: list[str] | None = None) -> None:
             max_technical_candidates=args.max_technical_candidates,
             max_correction_rounds=args.max_correction_rounds,
         )
+        final_config = FinalizationConfig(
+            enabled=args.finalization,
+            max_prefinal_repair_rounds=args.max_prefinal_repair_rounds,
+            allow_finalize_with_limitations=args.allow_finalize_with_limitations,
+            finalizer_timeout_seconds=args.finalizer_timeout,
+            finalizer_retries=args.finalizer_retries,
+            allow_complete_with_warnings=args.allow_complete_with_warnings,
+        )
     except ValueError as exc:
         parser.error(str(exc))
+    workspace = args.workspace.resolve()
+    if subcommand == "finalize":
+        if formal_research_block_reason(workspace) is not None:
+            parser.error("scope approval is required before finalization")
+        if not args.allow_dirty and not is_workspace_clean(workspace):
+            parser.error("workspace is dirty; commit changes or pass --allow-dirty")
+        try:
+            with ProjectLock(workspace):
+                run_finalization_pipeline(
+                    workspace,
+                    current_round(workspace),
+                    args.num_workers,
+                    args.manager_timeout,
+                    backend,
+                    topic_config,
+                    final_config,
+                )
+        except ProjectLockedError as exc:
+            parser.error(str(exc))
+        return
     run_slr(
-        workspace=args.workspace.resolve(),
+        workspace=workspace,
         max_rounds=args.max_rounds,
         num_workers=args.num_workers,
         worker_timeout=args.worker_timeout,
@@ -1140,6 +1672,7 @@ def main(argv: list[str] | None = None) -> None:
         backend=backend,
         allow_dirty=args.allow_dirty,
         topic_config=topic_config,
+        finalization_config=final_config,
     )
 
 
