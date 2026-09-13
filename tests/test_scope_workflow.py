@@ -64,7 +64,9 @@ Unrelated mechanisms.
 Hybrid systems require manual judgment.
 
 ## 5. Proposed Literature Organization
-Architectures, storage, retrieval, update, and utilization.
+| Research Line ID | Research Line | Primary Group | Definition | Main Scope Question |
+|---|---|---|---|---|
+| RL-RETRIEVAL-MEMORY | Retrieval memory | Architectures | External retrieval and update | How is memory retrieved? |
 
 ## 6. Inclusion Criteria
 Objective relevance, evidence, date, language, and accessibility rules.
@@ -80,15 +82,40 @@ version merging.
 Motivation, architecture, datasets, models, baselines, metrics, results,
 limitations, and reproducibility.
 
-## 10. Expected Deliverables
+## 10. Research-Line Prioritization and Synthesis Policy
+### Ranking Unit
+research_line
+### Primary Grouping
+Group by method family.
+### Ranking Mode
+ordinal
+### Priority Factors
+| Factor ID | Factor | Meaning | Operational rubric | Evidence required |
+|---|---|---|---|---|
+| REL | Scope relevance | Directness | Core to peripheral | scope evidence |
+### Priority Tiers
+Core, Supporting, Peripheral, Insufficient Evidence.
+### Primary Ordering
+Core, Supporting, Peripheral, Insufficient Evidence.
+### Secondary Ordering
+Scope relevance, then year descending.
+### Missing-Data Policy
+Unknown values remain unknown and are never zero.
+### Contradictory-Evidence Policy
+Always surface material contradictions in Section 4.
+### Paper Evidence Roles
+anchor, representative, supporting, contradictory, peripheral, unassigned.
+
+## 11. Expected Deliverables
 Per-paper notes, topic synthesis, global synthesis, and final review.
 
-## 11. Known Limitations and Uncertainties
+## 12. Known Limitations and Uncertainties
 [UNVERIFIED] Coverage may be incomplete when retrieval providers are unavailable.
 
-## 12. Approval Checklist
+## 13. Approval Checklist
 - [ ] Confirm boundaries.
 - [ ] Confirm comparison dimensions.
+- [ ] Confirm research lines, priority factors, tiers, ordering, and missing-data policy.
 """
 
 
@@ -172,7 +199,44 @@ def test_approve_materializes_formal_scope_and_is_idempotent(tmp_path: Path) -> 
         workspace / "SCOPE_PROPOSAL.md"
     ).read_text(encoding="utf-8")
     assert (workspace / "TASKS.md").is_file()
+    assert (workspace / "artifacts/SCOPE_PRIORITIZATION.json").is_file()
     assert approve_scope(workspace, 1) is False
+
+
+def test_missing_prioritization_policy_blocks_approval_ready(tmp_path: Path) -> None:
+    workspace = _project(tmp_path)
+
+    def missing_policy(backend, agent_name, prompt, cwd, timeout):
+        proposal = _proposal()
+        start = proposal.index("## 10. Research-Line Prioritization")
+        end = proposal.index("## 11. Expected Deliverables")
+        (cwd / "SCOPE_PROPOSAL.md").write_text(
+            proposal[:start] + proposal[end:], encoding="utf-8"
+        )
+        (cwd / "SCOPE_SOURCES.md").write_text(_sources(), encoding="utf-8")
+        return AgentExecutionResult(0, "", "")
+
+    assert not run_scope_preparation(
+        workspace, RecordingBackend(), 30, missing_policy
+    )
+    assert "prioritization" in str(load_scope_state(workspace)["failure"]).lower()
+
+
+def test_incomplete_secondary_ordering_is_only_warning(tmp_path: Path) -> None:
+    workspace = _project(tmp_path)
+
+    def incomplete_rubric(backend, agent_name, prompt, cwd, timeout):
+        proposal = _proposal().replace(
+            "### Secondary Ordering\nScope relevance, then year descending.\n", ""
+        )
+        (cwd / "SCOPE_PROPOSAL.md").write_text(proposal, encoding="utf-8")
+        (cwd / "SCOPE_SOURCES.md").write_text(_sources(), encoding="utf-8")
+        return AgentExecutionResult(0, "", "")
+
+    assert run_scope_preparation(
+        workspace, RecordingBackend(), 30, incomplete_rubric
+    )
+    assert load_scope_state(workspace)["validation_warnings"]
 
 
 def test_wrong_revision_cannot_be_approved(tmp_path: Path) -> None:

@@ -24,7 +24,8 @@ def test_topic_agent_definitions_and_skill_are_deployed(tmp_path: Path) -> None:
     assert "mcp__scholarly__*" in academic
     assert "mcp__arxiv__*" in checker
     assert "mcp__tavily__*" in technical
-    assert "mcp__tavily__*" not in academic
+    assert "mcp__tavily__*" in academic
+    assert "mcp__tavily__*" in checker
     assert "TAVILY_API_KEY=" not in coordinator + academic + checker + technical
     assert "WebSearch" not in manager
     assert "add an unregistered paper" in manager

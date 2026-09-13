@@ -57,6 +57,8 @@ def test_claude_passes_requested_agent_name_as_argv():
         "slr-scoper", "prepare scope", Path("/tmp/ws")
     )
     assert cmd == [
+        "env",
+        "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0",
         "claude",
         "--dangerously-skip-permissions",
         "--agent",
@@ -68,7 +70,14 @@ def test_claude_passes_requested_agent_name_as_argv():
 
 def test_claude_without_agent_name_is_backwards_compatible():
     cmd = ClaudeCodeBackend().build_command(None, "hello", Path("/tmp/ws"))
-    assert cmd == ["claude", "--dangerously-skip-permissions", "-p", "hello"]
+    assert cmd == [
+        "env",
+        "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0",
+        "claude",
+        "--dangerously-skip-permissions",
+        "-p",
+        "hello",
+    ]
 
 
 def test_claude_prompt_is_one_argv_element():

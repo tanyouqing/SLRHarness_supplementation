@@ -23,6 +23,12 @@ note per included source plus `technical_sources/index.json`, or an explicit
 `technical_sources/NO_RESULTS.md` when access yields no reliable source. Do not
 write the topic synthesis or modify protected workspace control files.
 
+When applicable, add optional `research_line_ids` and one `support_role` to the
+technical index/note. Allowed roles are implementation_detail,
+official_system_description, reproducibility_support, benchmark_description,
+historical_context, claim_only, and unassigned. This association supports
+implementation understanding but does not count as independent academic evidence.
+
 Every note must expose the shared skill's stable Source ID, first/third-party
 classification, claims, evidence locators, related Paper IDs, reliability
 caveats, and verification status; never collapse these into an unstructured

@@ -283,12 +283,44 @@ use `--topic-execution-mode legacy_worker`. An individual TASKS entry can
 override the global mode by starting its description with
 `[mode=legacy_worker]` or `[mode=topic_coordinator]`.
 
-Search access is role-scoped: academic worker and metadata checker use arXiv,
-scholarly, and WebSearch/WebFetch fallbacks; the technical worker alone uses
-optional Tavily plus WebSearch/WebFetch. No API key is written to project
+Search access is role-scoped: academic worker and metadata checker use
+scholarly/arXiv, then Tavily, then WebSearch/WebFetch; the technical worker uses
+Tavily plus WebSearch/WebFetch. No API key is written to project
 files. This implementation was exercised with Claude Code 2.1.269; use a
 current stable Claude Code release and verify agents/MCP connections before a
 real run.
+
+## Research-line prioritization
+
+The approved scope organizes the review around research lines or method
+families, not a ranking of individual papers. Comparison dimensions are facts
+extracted from papers or lines; priority factors are cross-line judgments used
+by the Manager/Finalizer. Before approval, review the proposed groups, stable
+`RL-...` IDs, factor/tier rubric, ordering and tiebreaker, missing-data policy,
+and contradictory-evidence policy.
+
+Approval compiles the policy into `artifacts/SCOPE_PRIORITIZATION.json`.
+Manager tasks may carry `[line=RL-...]` beside `[mode=topic_coordinator]`; old
+tasks receive a stable topic-path fallback ID. Topic syntheses provide local
+line assessments, paper notes record optional evidence roles, and
+`SOURCE_REGISTRY.json` merges these into `research_lines`. Missing optional
+assessments remain warnings and unknown values never become zero.
+
+The default ordinal tiers are Core, Supporting, Peripheral, and Insufficient
+Evidence. They control narrative prominence: Core lines receive full treatment,
+Supporting lines concise comparison, Peripheral lines brief/table coverage,
+and evidence-limited lines explicit disclosure. Paper roles—anchor,
+representative, supporting, contradictory, peripheral, and unassigned—describe
+evidentiary function, not quality. Material contradictory evidence must appear
+in final Section 4 regardless of tier. Numeric or weighted ranking is used only
+when the approved scope supplies an operational rubric; otherwise the pipeline
+records a qualitative fallback.
+
+Final Section 3 contains a research-line prioritization table and findings by
+approved group/order. Prioritization limitations disclose incomplete contracts,
+unranked lines, missing factors, access-depth effects, and agent judgment.
+Citation counts are time-biased, technical sources are not independent academic
+evidence, and the result is not an objective paper leaderboard.
 
 ## Finalization, global provenance, and bounded repair
 

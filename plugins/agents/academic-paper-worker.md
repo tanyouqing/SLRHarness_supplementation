@@ -29,6 +29,12 @@ stable, evidence-located note per included paper plus `papers/index.json` (or
 an explicit `papers/NO_RESULTS.md`). Never invent inaccessible details and do
 not write the topic synthesis.
 
+Associate each included paper with one or more approved Research Line IDs and
+assign its evidence role for the current line: anchor, representative,
+supporting, contradictory, peripheral, or unassigned. These are evidence roles,
+not paper-quality rankings. Extract comparison-dimension evidence when it is
+available; keep unavailable values explicit and never turn them into zero.
+
 Read `.claude/templates/paper-note.md` and use it as the canonical structure
 for every included paper. Populate its machine-readable frontmatter, including
 a stable `paper_id`; use explicit Not reported/Not applicable/unavailable or

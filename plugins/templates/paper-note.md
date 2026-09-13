@@ -14,6 +14,8 @@ reading_status: depth_read
 metadata_status: PASS
 discovery_route: keyword_search
 note_status: complete
+research_line_ids: ["RL-..."]
+primary_evidence_role: "unassigned"
 ---
 
 # <Paper title>
@@ -61,7 +63,26 @@ metric, benchmark, comparator/condition, and evidence locator.
 
 Do not copy long passages. Mark inaccessible or uncertain claims `[UNVERIFIED]`.
 
-## Landscape relationships and scope relevance
+## Scope-Driven Positioning
+
+### Related Research Lines
+
+- RL-...: <relationship to this method/research line>
+
+### Evidence Role
+
+- Role: anchor | representative | supporting | contradictory | peripheral | unassigned
+- Reason:
+- Scope question supported:
+- Evidence limitations:
+
+These roles describe how this paper supports a research line; they are not
+paper-quality rankings. A contradictory paper must remain visible in Section 4.
+
+### Comparison-Dimension Evidence
+
+| Dimension | Value or observation | Evidence ID / locator | Verification status |
+|---|---|---|---|
 
 Record related works, the relationship to the approved scope/current topic,
 and whether discovery used keyword search, backward citation, forward citation,

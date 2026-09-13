@@ -19,6 +19,17 @@
   "communication": {"file_queue_fallback": true},
   "paper_notes": {"template": ".claude/templates/paper-note.md"},
   "source_registry": {"enabled": true, "deduplicate": true},
+  "prioritization": {
+    "enabled": true,
+    "ranking_unit": "research_line",
+    "default_mode": "ordinal",
+    "missing_value_policy": "unknown_not_zero",
+    "incomplete_topic_assessment_is_fatal": false,
+    "missing_paper_role_is_fatal": false,
+    "require_final_prioritization_section": true,
+    "surface_contradictory_evidence": true,
+    "allow_qualitative_fallback": true
+  },
   "finalization": {
     "enabled": true,
     "finalizer_agent": "slr-manager",

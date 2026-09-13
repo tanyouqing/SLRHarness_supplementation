@@ -24,6 +24,7 @@ from slrharness.orchestrator import (
     run_finalization_pipeline,
 )
 from slrharness.scope_workflow import initialize_direct_approved_state
+from slrharness.prioritization import write_scope_prioritization
 from slrharness.source_registry import (
     REGISTRY_PATH,
     _deduplicate_papers,
@@ -235,6 +236,9 @@ def _valid_report(workspace: Path) -> str:
     registry = json.loads((workspace / REGISTRY_PATH).read_text(encoding="utf-8"))
     paper_id = registry["papers"][0]["source_id"]
     technical_id = registry["technical_sources"][0]["source_id"]
+    line = registry["research_lines"][0]
+    line_id = line["line_id"]
+    line_group = line["group"]
     delivery = delivery_statistics(workspace, registry)
     delivery_lines = "\n".join(f"- {key}: {value}" for key, value in delivery.items())
     filler = (
@@ -249,7 +253,14 @@ Memory means persisted agent information ({paper_id}) [{paper_id}]. {filler}
 The problem matters for reliable systems [{paper_id}]. {filler}
 
 ## Section 3 — Existing Research: Motivations, Methodologies, and Findings
-Work is organized by mechanism. {filler}
+### Organization and Prioritization Policy
+Research lines, not papers, are ranked qualitatively; this is not a paper-quality ranking.
+### Scope-Driven Research-Line Prioritization
+| Order | Research Line ID | Research Line | Group | Tier/Score | Evidence basis | Representative papers |
+|---|---|---|---|---|---|---|
+| 1 | {line_id} | {line["name"]} | {line_group} | Insufficient Evidence | one topic | [{paper_id}] |
+### Findings by Research Line
+Work is organized by approved mechanism group {line_group}. {filler}
 | Work | Motivation | Method | Benchmark | Finding | Limitation |
 |---|---|---|---|---|---|
 | Smith (2024) [{paper_id}] | persistence | retrieval | Bench | improvement | narrow data |
@@ -268,6 +279,8 @@ Framework and model-version differences prevent direct comparison [{paper_id}]. 
 The risk is protocol sensitivity and the direction is a reviewer inference.
 
 ## Coverage and Limitations
+### Prioritization Limitations
+The qualitative fallback contains agent judgment and is not a paper-quality ranking.
 One paper was depth-read. Retrieval and metadata limits are disclosed. {filler}
 
 ## Sources and Provenance
@@ -336,6 +349,65 @@ def test_abstract_only_and_numeric_warning(tmp_path: Path) -> None:
     result = validate_paper_note(tmp_path, note)
     assert result.valid
     assert result.warnings
+
+
+def test_paper_note_research_line_roles_are_optional_warnings(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    note = workspace / "topics/a/one/papers/paper-1.md"
+    legacy = validate_paper_note(workspace, note)
+    assert legacy.valid
+    assert any("research_line_ids" in warning for warning in legacy.warnings)
+    text = note.read_text(encoding="utf-8").replace(
+        "note_status: complete",
+        'note_status: complete\nresearch_line_ids: ["RL-A-ONE"]\nprimary_evidence_role: "contradictory"',
+    ).replace(
+        "## Landscape relationships and scope relevance",
+        "## Scope-Driven Positioning",
+    )
+    note.write_text(text, encoding="utf-8")
+    valid = validate_paper_note(workspace, note)
+    assert valid.valid
+    assert not any("invalid evidence role" in warning for warning in valid.warnings)
+    note.write_text(text.replace('"contradictory"', '"winner"'), encoding="utf-8")
+    invalid = validate_paper_note(workspace, note)
+    assert invalid.valid
+    assert any("invalid evidence role" in warning for warning in invalid.warnings)
+
+
+def test_registry_merges_topics_by_line_and_preserves_uncovered_scope_line(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path, ("topics/a/one", "topics/b/two"))
+    scope = """# Scope
+## Proposed Literature Organization
+| Research Line ID | Research Line | Primary Group | Definition | Main Scope Question |
+|---|---|---|---|---|
+| RL-SHARED | Shared line | Methods | shared | question |
+| RL-UNCOVERED | Uncovered line | Methods | uncovered | question |
+## Research-Line Prioritization and Synthesis Policy
+### Ranking Unit
+research_line
+### Primary Grouping
+Methods
+### Ranking Mode
+ordinal
+### Priority Tiers
+Core, Supporting, Peripheral, Insufficient Evidence
+### Missing-Data Policy
+unknown_not_zero
+"""
+    (workspace / "SCOPE.md").write_text(scope, encoding="utf-8")
+    write_scope_prioritization(workspace)
+    (workspace / "TASKS.md").write_text(
+        "- [x] topics/a/one -- [line=RL-SHARED] complete\n"
+        "- [x] topics/b/two -- [line=RL-SHARED] complete\n",
+        encoding="utf-8",
+    )
+    registry = aggregate_sources(workspace).registry
+    lines = {line["line_id"]: line for line in registry["research_lines"]}
+    assert len(lines["RL-SHARED"]["topic_paths"]) == 2
+    assert lines["RL-UNCOVERED"]["ranking_status"] == "INSUFFICIENT_EVIDENCE"
+    assert registry["papers"][0]["research_line_ids"] == ["RL-SHARED"]
 
 
 def test_aggregation_deduplicates_doi_and_is_idempotent(tmp_path: Path) -> None:
@@ -423,7 +495,11 @@ def test_prefinal_pass_and_missing_synthesis_stable_gap(tmp_path: Path) -> None:
     aggregate_sources(workspace)
     config = FinalizationConfig()
     passed = run_structural_prefinal_audit(workspace, config)
-    assert passed["status"] == "PASS"
+    assert passed["status"] == "PASS_WITH_LIMITATIONS"
+    assert any(
+        gap["category"] == "prioritization"
+        for gap in passed["coverage_gaps"]
+    )
     (workspace / "topics/a/one.md").unlink()
     failed1 = run_structural_prefinal_audit(workspace, config)
     failed2 = run_structural_prefinal_audit(workspace, config)
@@ -444,6 +520,7 @@ def test_finalizer_prompt_has_explicit_inputs_and_no_search(tmp_path: Path) -> N
     )
     for path in (
         "SCOPE.md",
+        "SCOPE_PRIORITIZATION.json",
         "SOURCE_REGISTRY.json",
         "PAPER_LIST.md",
         "REFERENCES.md",
@@ -464,6 +541,50 @@ def test_valid_final_report_and_unverified_count(tmp_path: Path) -> None:
     result = validate_final_report(workspace, FinalizationConfig())
     assert result.accepted
     assert result.audit["unverified_claim_markers"] == 1
+
+
+def test_legacy_workspace_lazily_receives_compiled_contract(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    contract_path = workspace / "artifacts/SCOPE_PRIORITIZATION.json"
+    assert not contract_path.exists()
+    aggregate_sources(workspace)
+    assert contract_path.is_file()
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert contract["ranking_mode"] == "qualitative_fallback"
+    assert contract["missing_data_policy"] == "unknown_not_zero"
+
+
+def test_final_report_rejects_unknown_line_and_hidden_contradiction(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    aggregate_sources(workspace)
+    report = _valid_report(workspace)
+    (workspace / "SUMMARY.md").write_text(
+        report.replace("RL-A-ONE", "RL-NOT-IN-REGISTRY"), encoding="utf-8"
+    )
+    assert any(
+        "unknown Research Line" in error
+        for error in validate_final_report(workspace, FinalizationConfig()).errors
+    )
+
+    registry_path = workspace / REGISTRY_PATH
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    paper_id = registry["papers"][0]["source_id"]
+    registry["research_lines"][0]["paper_roles"]["contradictory"] = [paper_id]
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    hidden = _valid_report(workspace).replace(
+        f"so no broad consensus is claimed [{paper_id}].",
+        "so no broad consensus is claimed.",
+    ).replace(
+        f"Framework and model-version differences prevent direct comparison [{paper_id}].",
+        "Framework and model-version differences prevent direct comparison.",
+    )
+    (workspace / "SUMMARY.md").write_text(hidden, encoding="utf-8")
+    assert any(
+        "contradictory papers" in error
+        for error in validate_final_report(workspace, FinalizationConfig()).errors
+    )
     assert (workspace / FINAL_AUDIT_PATH).is_file()
 
 

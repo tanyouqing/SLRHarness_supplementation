@@ -44,6 +44,12 @@ from slrharness.finalization import (
     validate_prefinal_audit,
 )
 from slrharness.project_lock import ProjectLock, ProjectLockedError
+from slrharness.prioritization import (
+    PRIORITIZATION_PATH,
+    VALID_LINE_ID,
+    fallback_research_line_id,
+    load_scope_prioritization,
+)
 from slrharness.scope_workflow import (
     formal_research_block_reason,
     load_scope_state,
@@ -87,6 +93,20 @@ class Task:
     topic_path: str  # e.g., "topics/efficiency/pruning"
     description: str  # Free-form description
     execution_mode: str | None = None
+    research_line_id: str | None = None
+    prioritization_warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.research_line_id is None:
+            object.__setattr__(
+                self, "research_line_id", fallback_research_line_id(self.topic_path)
+            )
+            if not self.prioritization_warnings:
+                object.__setattr__(
+                    self,
+                    "prioritization_warnings",
+                    ("missing line marker; stable topic-path fallback used",),
+                )
 
 
 @dataclass(frozen=True)
@@ -138,6 +158,14 @@ def parse_pending_tasks(tasks_md: Path) -> list[Task]:
     """
     content = tasks_md.read_text(encoding="utf-8")
     tasks: list[Task] = []
+    known_lines: set[str] | None = None
+    if (tasks_md.parent / PRIORITIZATION_PATH).is_file():
+        contract = load_scope_prioritization(tasks_md.parent)
+        known_lines = {
+            str(item.get("line_id"))
+            for item in contract.get("research_lines", [])
+            if isinstance(item, dict) and item.get("line_id")
+        }
 
     round_pattern = re.compile(
         r"^\s*##\s+Round\s+(\d+)\s*$", re.MULTILINE | re.IGNORECASE
@@ -190,17 +218,37 @@ def parse_pending_tasks(tasks_md: Path) -> list[Task]:
         topic_path = match.group(1).rstrip("/")
         description = match.group(2).strip()
         execution_mode = None
-        mode_match = re.match(
-            r"^\[mode=(legacy_worker|topic_coordinator)\]\s*", description
-        )
-        if mode_match:
-            execution_mode = mode_match.group(1)
-            description = description[mode_match.end() :].strip()
+        research_line_id = None
+        task_warnings: list[str] = []
+        while True:
+            marker = re.match(
+                r"^\[(mode|line)=([^\]]+)\]\s*", description, re.IGNORECASE
+            )
+            if marker is None:
+                break
+            key, value = marker.group(1).lower(), marker.group(2).strip()
+            description = description[marker.end() :].strip()
+            if key == "mode" and value in {LEGACY_WORKER, TOPIC_COORDINATOR}:
+                execution_mode = value
+            elif key == "mode":
+                task_warnings.append(f"unknown execution mode marker: {value}")
+            elif value.upper() == "NOT_APPLICABLE":
+                research_line_id = "NOT_APPLICABLE"
+            elif VALID_LINE_ID.fullmatch(value.upper()):
+                research_line_id = value.upper()
+                if known_lines is not None and research_line_id not in known_lines:
+                    task_warnings.append(
+                        f"unknown approved Research Line ID retained: {research_line_id}"
+                    )
+            else:
+                task_warnings.append(f"invalid line marker ignored: {value}")
         tasks.append(
             Task(
                 topic_path=topic_path,
                 description=description,
                 execution_mode=execution_mode,
+                research_line_id=research_line_id,
+                prioritization_warnings=tuple(task_warnings),
             )
         )
 
@@ -301,6 +349,7 @@ def build_manager_prompt(workspace: Path, round_num: int, phase: str) -> str:
         Workspace files:
         - SCOPE_ORIGINAL.md (immutable baseline)
         - SCOPE.md (canonical approved scope; immutable during formal research)
+        - {PRIORITIZATION_PATH} (program-derived approved research-line contract)
         - TASKS.md (task registry, checkbox format)
         - SUMMARY.md (evolving synthesis with comparison tables)
         - topics/ (READ ONLY). A TASKS entry `topics/x/y` has exactly one
@@ -315,15 +364,21 @@ def build_manager_prompt(workspace: Path, round_num: int, phase: str) -> str:
             PLAN PASS -- your responsibilities this invocation:
 
             1. Read SCOPE_ORIGINAL.md, SCOPE.md, TASKS.md, SUMMARY.md.
-            2. If this is round 1 and TASKS.md has no pending tasks, break down
-               SCOPE.md into concrete research tasks. Each task should be narrow
-               enough for a single worker to complete. Format each pending task as:
-                 - [ ] topics/{{topic}}/{{subtopic}} -- {{one-line description}}
+            2. If this is round 1 and TASKS.md has no pending tasks, read SCOPE.md
+               and {PRIORITIZATION_PATH}, then break the approved research lines
+               into concrete tasks. Prefer one research line (or one clear
+               subquestion of it) per topic. Format each pending task as:
+                 - [ ] topics/{{group}}/{{topic}} -- [line=RL-...] {{description}}
+               Use `[line=NOT_APPLICABLE]` only for genuinely cross-cutting work.
+               `[line=...]` and optional `[mode=...]` markers may appear in either
+               order. Do not silently add a new line to the approved contract.
             3. If there are new files in topics/ since the last review commit,
                incorporate their findings into SUMMARY.md comparison tables,
                maintaining the ranking & grouping order defined in SCOPE.md.
-               When workers extracted ranking scores in their `## Ranking Scores`
-               section, use those scores (recompute the composite if defined).
+               Aggregate research-line assessments from coordinator manifests;
+               retain differing proposed tiers for final corpus-wide calibration.
+               For legacy-worker `## Ranking Scores`, use them only as optional
+               supporting input and recompute any approved composite.
             4. If workers propose new comparison dimensions, use only those
                already covered by the approved scope; record broader ideas as
                future work without editing SCOPE.md.
@@ -352,8 +407,11 @@ def build_manager_prompt(workspace: Path, round_num: int, phase: str) -> str:
                - Sources include working links (paper, project page, code, dataset
                  where applicable)
                - Workspace context links at top are correct
-               - If SCOPE.md defines ranking criteria, the worker's
-                 `## Ranking Scores` section is present and follows the rubric
+               - Topic-coordinator output uses `## Scope-Driven Research-Line
+                 Assessment`; incomplete optional prioritization is a warning,
+                 not a reason to reject otherwise complete evidence artifacts
+               - Legacy-worker output retains `## Ranking Scores` when SCOPE.md
+                 defines an operational legacy ranking rubric
                - `## Related Topics` connects to at least one sibling topic when
                  such connections exist
             3. In TASKS.md, mark successfully completed tasks with `[x]` and move
@@ -782,6 +840,8 @@ def run_topic_coordinators(
                 attempt,
                 config,
                 diagnostics,
+                task.research_line_id,
+                task.prioritization_warnings,
             )
             states[topic_path] = state
             prompt = build_coordinator_prompt(

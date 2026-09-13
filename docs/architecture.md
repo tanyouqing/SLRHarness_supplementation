@@ -1,5 +1,35 @@
 # SLRHarness v1 architecture
 
+## Scope-driven research-line layer
+
+The approved scope remains the source of grouping and ordering truth:
+
+```text
+SCOPE.md
+  -> artifacts/SCOPE_PRIORITIZATION.json (program-derived, rebuildable)
+  -> TASKS.md [line=RL-...]
+  -> topic synthesis + optional manifest prioritization
+  -> SOURCE_REGISTRY.json research_lines
+  -> pre-final coverage/evidence audit
+  -> final Section 3 grouping, order, and narrative prominence
+```
+
+A research line is a method family or coherent technical route. Papers and
+technical sources support lines; they are not the primary ranking units.
+Comparison dimensions remain per-item facts, while priority factors drive
+cross-line synthesis. The default ordinal policy uses Core, Supporting,
+Peripheral, and Insufficient Evidence. Numeric and weighted modes are computed
+only when the approved contract is operational; missing values remain unranked
+and never become zero.
+
+Coordinator assessments are local and optional. Missing tiers, dimensions,
+roles, or factor values propagate as warnings rather than topic reruns. Only
+missing core evidence can create bounded research repair. Final-report
+structural violations retry the Finalizer alone. Emergent lines are marked
+`EMERGENT_UNAPPROVED`; they do not silently extend the approved scope.
+Contradictory evidence remains visible in Section 4 regardless of narrative
+priority.
+
 SLRHarness is not a single Skill because durable lifecycle control, bounded
 process execution, validation, concurrency, and recovery must remain
 deterministic. Skills and agents supply research judgment; Python owns authority.

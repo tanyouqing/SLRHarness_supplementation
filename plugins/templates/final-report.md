@@ -6,6 +6,19 @@
 
 ## Section 3 — Existing Research: Motivations, Methodologies, and Findings
 
+### Organization and Prioritization Policy
+
+Explain the approved primary grouping, ordering, tiebreaker, and missing-data
+policy. Research lines—not individual papers—are the ranking units. State that
+the result controls narrative emphasis and is not a paper-quality ranking.
+
+### Scope-Driven Research-Line Prioritization
+
+| Order | Research Line ID | Research Line | Group | Tier/Score | Evidence basis | Representative papers |
+|---|---|---|---|---|---|---|
+
+### Findings by Research Line
+
 | Work | Motivation | Method family | Core mechanism | Model/agent | Benchmark | Main finding | Limitation |
 |---|---|---|---|---|---|---|---|
 
@@ -21,6 +34,12 @@
 |---|---|---|---|---|
 
 ## Coverage and Limitations
+
+### Prioritization Limitations
+
+Disclose contract completeness, qualitative fallback, unranked or
+evidence-limited lines, missing factors, the role of agent judgment, and why
+the ordering must not be interpreted as a paper-quality ranking.
 
 ## Sources and Provenance
 

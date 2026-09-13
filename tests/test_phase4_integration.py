@@ -116,14 +116,28 @@ def test_offline_scope_to_complete_without_gap(tmp_path: Path, monkeypatch) -> N
             "Comparison Dimensions",
             "Expected Deliverables",
             "Limitations",
-            "Approval Checklist",
         ]
         (cwd / "SCOPE_PROPOSAL.md").write_text(
             "# Scope Proposal\n"
             + "\n".join(
                 f"## {heading}\n" + "bounded evidence scope " * 12
                 for heading in sections
-            ),
+            )
+            + """
+## Research-Line Prioritization and Synthesis Policy
+### Ranking Unit
+research_line
+### Primary Grouping
+method family
+### Ranking Mode
+ordinal
+### Priority Tiers
+Core, Supporting, Peripheral, Insufficient Evidence
+### Missing-Data Policy
+unknown_not_zero
+## Approval Checklist
+- [ ] Confirm ranking, grouping, ordering, and prioritization policy.
+""",
             encoding="utf-8",
         )
         (cwd / "SCOPE_SOURCES.md").write_text(

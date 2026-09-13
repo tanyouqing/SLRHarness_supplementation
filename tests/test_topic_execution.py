@@ -169,6 +169,60 @@ def test_prompt_names_roles_parallel_and_file_corrections(tmp_path: Path) -> Non
     assert "correction_requests.jsonl" in prompt
     assert "prior error" in prompt
     assert "Agent Team" in prompt
+    assert "SCOPE_PRIORITIZATION.json" in prompt
+    assert "RESEARCH LINE ID" in prompt
+
+
+def test_complete_and_missing_prioritization_are_nonfatal(tmp_path: Path) -> None:
+    write_valid_topic(tmp_path)
+    paths = topic_paths(tmp_path, "topics/memory/retrieval")
+    missing = validate_coordinator_outputs(tmp_path, paths)
+    assert missing.accepted
+    assert any("prioritization" in warning for warning in missing.warnings)
+
+    manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
+    manifest["prioritization"] = {
+        "research_line_id": "RL-MEMORY-RETRIEVAL",
+        "ranking_applicability": "applicable",
+        "proposed_tier": "Core",
+        "confidence": "medium",
+        "comparison_values": {},
+        "factor_assessments": {},
+        "paper_roles": {"P-ONE": "anchor"},
+    }
+    _write_json(paths.manifest, manifest)
+    paths.synthesis.write_text(
+        paths.synthesis.read_text(encoding="utf-8")
+        + "\n## Scope-Driven Research-Line Assessment\nLocal proposed tier: Core.\n",
+        encoding="utf-8",
+    )
+    complete = validate_coordinator_outputs(tmp_path, paths)
+    assert complete.accepted
+
+
+def test_invalid_prioritization_values_only_warn(tmp_path: Path) -> None:
+    write_valid_topic(tmp_path)
+    paths = topic_paths(tmp_path, "topics/memory/retrieval")
+    manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
+    manifest["prioritization"] = {
+        "research_line_id": "RL-UNKNOWN",
+        "ranking_applicability": "applicable",
+        "proposed_tier": "Best",
+        "paper_roles": {"P-ONE": "quality_winner"},
+    }
+    _write_json(paths.manifest, manifest)
+    result = validate_coordinator_outputs(tmp_path, paths)
+    assert result.accepted
+    assert len([warning for warning in result.warnings if "prioritization" in warning]) >= 3
+
+
+def test_correction_queue_legacy_empty_and_comment_do_not_fail(tmp_path: Path) -> None:
+    write_valid_topic(tmp_path)
+    paths = topic_paths(tmp_path, "topics/memory/retrieval")
+    (paths.audit_dir / "correction_requests.jsonl").write_text(
+        "// old agent comment\n[]\n", encoding="utf-8"
+    )
+    assert validate_coordinator_outputs(tmp_path, paths).accepted
 
 
 def test_valid_complete_and_zero_result_topics(tmp_path: Path) -> None:

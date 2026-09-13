@@ -11,6 +11,15 @@ from pathlib import Path
 from typing import Any
 
 from slrharness.contracts import SCHEMA_VERSION, atomic_write_json, atomic_write_text
+from slrharness.prioritization import (
+    PAPER_ROLES,
+    PRIORITIZATION_PATH,
+    PRIORITY_TIERS,
+    fallback_research_line_id,
+    load_scope_prioritization,
+    rank_research_lines,
+    write_scope_prioritization,
+)
 
 ARTIFACTS_DIR = "artifacts"
 REGISTRY_PATH = "artifacts/SOURCE_REGISTRY.json"
@@ -217,6 +226,24 @@ def validate_paper_note(
         result.errors.append(
             f"invalid reading status: {metadata.get('reading_status')!r}"
         )
+    contract = load_scope_prioritization(workspace)
+    known_lines = {
+        str(item.get("line_id"))
+        for item in contract.get("research_lines", [])
+        if isinstance(item, dict) and item.get("line_id")
+    }
+    raw_line_ids = metadata.get("research_line_ids")
+    line_ids = raw_line_ids if isinstance(raw_line_ids, list) else []
+    if not line_ids:
+        result.warnings.append("paper note has no research_line_ids")
+    for line_id in line_ids:
+        if str(line_id) not in known_lines:
+            result.warnings.append(f"paper note uses unknown Research Line ID {line_id}")
+    role = str(metadata.get("primary_evidence_role") or "").lower()
+    if not role:
+        result.warnings.append("paper note has no primary_evidence_role")
+    elif role not in PAPER_ROLES:
+        result.warnings.append(f"paper note has invalid evidence role {role!r}")
 
     required_sections = {
         "problem/motivation": r"^##\s+Problem and motivation",
@@ -228,6 +255,8 @@ def validate_paper_note(
     for label, pattern in required_sections.items():
         if not re.search(pattern, body, re.MULTILINE | re.IGNORECASE):
             result.errors.append(f"missing section: {label}")
+    if not re.search(r"^##\s+Scope-Driven Positioning\s*$", body, re.MULTILINE | re.IGNORECASE):
+        result.warnings.append("paper note has no Scope-Driven Positioning section")
     experiment_text = _section(body, "Data, experiments, and quantitative results")
     if not experiment_text.strip():
         result.errors.append("experimental setup/results are empty")
@@ -306,6 +335,14 @@ def _manifest_topics(workspace: Path) -> list[tuple[str, dict[str, Any], Path]]:
 
 def aggregate_sources(workspace: Path) -> AggregationResult:
     """Rebuild all global source artifacts deterministically without deleting notes."""
+    # Older approved workspaces predate the compiled contract. Rebuild that
+    # derived artifact lazily so downstream agents receive the same stable path
+    # without requiring a workspace migration step.
+    if not (workspace / PRIORITIZATION_PATH).is_file() and (
+        workspace / "SCOPE.md"
+    ).is_file():
+        write_scope_prioritization(workspace)
+
     previous = _load_json(workspace / REGISTRY_PATH) or {}
     previous_ids: dict[str, str] = {}
     for paper in previous.get("papers", []):
@@ -327,9 +364,13 @@ def aggregate_sources(workspace: Path) -> AggregationResult:
     validations: list[NoteValidation] = []
     structural_issues: list[str] = []
     topic_coverage: dict[str, dict[str, list[str]]] = {}
+    topic_assessments: list[tuple[str, dict[str, Any]]] = []
 
     for topic, manifest, _root in _manifest_topics(workspace):
         topic_coverage.setdefault(topic, {"papers": [], "technical_sources": []})
+        assessment = manifest.get("prioritization")
+        if isinstance(assessment, dict):
+            topic_assessments.append((topic, assessment))
         academic = manifest.get("academic_worker") or {}
         paper_index_value = academic.get("index_path")
         paper_index_path = _workspace_path(workspace, paper_index_value)
@@ -467,8 +508,20 @@ def aggregate_sources(workspace: Path) -> AggregationResult:
         "duplicates": duplicates,
         "unresolved_metadata": sorted(unresolved),
         "topic_coverage": topic_coverage,
+        "research_lines": [],
         "generated_at": _now(),
     }
+    registry["research_lines"] = _aggregate_research_lines(
+        workspace,
+        papers,
+        technical_sources,
+        topic_coverage,
+        topic_assessments,
+    )
+    contract = load_scope_prioritization(workspace)
+    registry["prioritization"] = rank_research_lines(
+        contract, registry["research_lines"]
+    )
     note_audit = {
         "schema_version": SCHEMA_VERSION,
         "status": (
@@ -509,6 +562,200 @@ def aggregate_sources(workspace: Path) -> AggregationResult:
         workspace / REFERENCES_PATH, _references(papers, technical_sources)
     )
     return AggregationResult(registry, note_audit, dedup_audit)
+
+
+def _task_line_markers(workspace: Path) -> dict[str, str]:
+    try:
+        text = (workspace / "TASKS.md").read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    output: dict[str, str] = {}
+    for match in re.finditer(
+        r"^\s*-\s*\[[ xX]\]\s+(topics/\S+).*?\[line=([^\]]+)\]",
+        text,
+        re.MULTILINE | re.IGNORECASE,
+    ):
+        output[match.group(1).rstrip("/")] = match.group(2).strip().upper()
+    return output
+
+
+def _topic_key(value: str) -> str:
+    return value.replace("\\", "/").removesuffix(".md").rstrip("/")
+
+
+def _aggregate_research_lines(
+    workspace: Path,
+    papers: list[dict[str, Any]],
+    technical_sources: list[dict[str, Any]],
+    topic_coverage: dict[str, dict[str, list[str]]],
+    topic_assessments: list[tuple[str, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Add a line-level view without changing source deduplication semantics."""
+    contract = load_scope_prioritization(workspace)
+    lines: dict[str, dict[str, Any]] = {}
+    for item in contract.get("research_lines", []):
+        if not isinstance(item, dict) or not item.get("line_id"):
+            continue
+        line_id = str(item["line_id"])
+        lines[line_id] = {
+            "line_id": line_id,
+            "name": item.get("name") or line_id,
+            "group": item.get("group") or "Unspecified",
+            "definition": item.get("definition") or "",
+            "scope_question": item.get("scope_question") or "",
+            "priority_tier": item.get("priority_tier"),
+            "scope_status": "APPROVED",
+            "topic_paths": [],
+            "paper_ids": [],
+            "technical_source_ids": [],
+            "paper_roles": {role: [] for role in PAPER_ROLES},
+            "comparison_values": {},
+            "factor_assessments": {},
+            "proposed_tiers": [],
+            "latest_year": None,
+            "_manifest_paper_roles": {},
+            "ranking_status": "INSUFFICIENT_EVIDENCE",
+            "warnings": list(item.get("warnings") or []),
+        }
+
+    def ensure(line_id: str) -> dict[str, Any] | None:
+        if not line_id or line_id == "NOT_APPLICABLE":
+            return None
+        if line_id not in lines:
+            lines[line_id] = {
+                "line_id": line_id,
+                "name": line_id,
+                "group": "Emergent",
+                "definition": "",
+                "scope_question": "",
+                "priority_tier": None,
+                "scope_status": "EMERGENT_UNAPPROVED",
+                "topic_paths": [],
+                "paper_ids": [],
+                "technical_source_ids": [],
+                "paper_roles": {role: [] for role in PAPER_ROLES},
+                "comparison_values": {},
+                "factor_assessments": {},
+                "proposed_tiers": [],
+                "latest_year": None,
+                "_manifest_paper_roles": {},
+                "ranking_status": "QUALITATIVE",
+                "warnings": ["research line is not defined in the approved scope"],
+            }
+        return lines[line_id]
+
+    task_markers = _task_line_markers(workspace)
+    topic_to_line: dict[str, str] = {}
+    assessment_by_topic = {_topic_key(topic): value for topic, value in topic_assessments}
+    for topic in topic_coverage:
+        key = _topic_key(topic)
+        assessment = assessment_by_topic.get(key, {})
+        line_id = str(assessment.get("research_line_id") or task_markers.get(key) or "")
+        if not line_id:
+            line_id = fallback_research_line_id(key)
+        line = ensure(line_id)
+        if line is None:
+            continue
+        topic_to_line[key] = line_id
+        line["topic_paths"].append(topic)
+        tier = str(assessment.get("proposed_tier") or "").strip()
+        if tier:
+            canonical = next(
+                (value for value in PRIORITY_TIERS if value.lower() == tier.lower()), tier
+            )
+            line["proposed_tiers"].append(
+                {"topic_path": topic, "tier": canonical, "confidence": assessment.get("confidence")}
+            )
+        for field in ("comparison_values", "factor_assessments"):
+            values = assessment.get(field)
+            if isinstance(values, dict):
+                for key_name, value in values.items():
+                    line[field].setdefault(str(key_name), []).append(
+                        {"topic_path": topic, "value": value}
+                    )
+        manifest_roles = assessment.get("paper_roles")
+        if isinstance(manifest_roles, dict):
+            line["_manifest_paper_roles"].update(
+                {str(key): str(value).lower() for key, value in manifest_roles.items()}
+            )
+        for source_id in assessment.get("supporting_source_ids", []):
+            line["technical_source_ids"].append(str(source_id))
+        line["warnings"].extend(str(value) for value in assessment.get("warnings", []) if value)
+
+    for paper in papers:
+        explicit = paper.get("research_line_ids") or []
+        associated = set(str(value) for value in explicit)
+        if not associated:
+            associated.update(
+                topic_to_line.get(_topic_key(str(topic)), "")
+                for topic in paper.get("topic_paths", [])
+            )
+            associated.discard("")
+        paper["research_line_ids"] = sorted(associated)
+        roles = paper.get("evidence_roles") if isinstance(paper.get("evidence_roles"), dict) else {}
+        for line_id in associated:
+            line = ensure(line_id)
+            if line is None:
+                continue
+            line["paper_ids"].append(paper["source_id"])
+            try:
+                publication_year = int(str(paper.get("year") or ""))
+            except ValueError:
+                publication_year = None
+            if publication_year is not None:
+                current_year = line.get("latest_year")
+                if current_year is None or publication_year > current_year:
+                    line["latest_year"] = publication_year
+            role = str(roles.get(line_id) or "").lower()
+            if not role:
+                aliases = {paper["source_id"], *paper.get("alias_ids", [])}
+                role = next(
+                    (
+                        value
+                        for paper_key, value in line["_manifest_paper_roles"].items()
+                        if paper_key in aliases
+                    ),
+                    "unassigned",
+                )
+            if role not in PAPER_ROLES:
+                line["warnings"].append(
+                    f"paper {paper['source_id']} has invalid role {role!r}; treated as unassigned"
+                )
+                role = "unassigned"
+            line["paper_roles"][role].append(paper["source_id"])
+
+    for source in technical_sources:
+        explicit = source.get("research_line_ids") or []
+        associated = set(str(value) for value in explicit)
+        if not associated:
+            associated.update(
+                topic_to_line.get(_topic_key(str(topic)), "")
+                for topic in source.get("topic_paths", [])
+            )
+            associated.discard("")
+        source["research_line_ids"] = sorted(associated)
+        for line_id in associated:
+            line = ensure(line_id)
+            if line is not None:
+                line["technical_source_ids"].append(source["source_id"])
+
+    for line in lines.values():
+        line.pop("_manifest_paper_roles", None)
+        for key in ("topic_paths", "paper_ids", "technical_source_ids"):
+            line[key] = sorted(set(line[key]))
+        for role in PAPER_ROLES:
+            line["paper_roles"][role] = sorted(set(line["paper_roles"][role]))
+        if not line["paper_ids"]:
+            line["ranking_status"] = "INSUFFICIENT_EVIDENCE"
+            line["warnings"].append("research line has no academic evidence")
+        elif line["scope_status"] == "EMERGENT_UNAPPROVED":
+            line["ranking_status"] = "QUALITATIVE"
+        elif line["warnings"] or contract.get("compile_status") == "PARTIAL":
+            line["ranking_status"] = "PARTIAL"
+        else:
+            line["ranking_status"] = "COMPLETE"
+        line["warnings"] = sorted(set(line["warnings"]))
+    return [lines[line_id] for line_id in sorted(lines)]
 
 
 def _deduplicate_papers(
@@ -568,6 +815,29 @@ def _deduplicate_papers(
             None,
         )
         source_id = existing_id or stable_paper_id(canonical)
+        research_line_ids = sorted(
+            {
+                str(line_id)
+                for item in members
+                for line_id in (
+                    item.get("research_line_ids")
+                    if isinstance(item.get("research_line_ids"), list)
+                    else []
+                )
+                if str(line_id)
+            }
+        )
+        evidence_roles: dict[str, str] = {}
+        for item in members:
+            item_roles = item.get("evidence_roles")
+            if isinstance(item_roles, dict):
+                evidence_roles.update(
+                    {str(key): str(value).lower() for key, value in item_roles.items()}
+                )
+            primary_role = str(item.get("primary_evidence_role") or "").lower()
+            item_lines = item.get("research_line_ids")
+            if primary_role and isinstance(item_lines, list) and item_lines:
+                evidence_roles.setdefault(str(item_lines[0]), primary_role)
         entry = {
             "source_id": source_id,
             "alias_ids": sorted(
@@ -588,6 +858,8 @@ def _deduplicate_papers(
             "version_group": canonical.get("version_group"),
             "note_paths": sorted({str(item.get("note_path")) for item in members}),
             "topic_paths": sorted({str(item.get("topic_path")) for item in members}),
+            "research_line_ids": research_line_ids,
+            "evidence_roles": evidence_roles,
             "metadata_status": canonical.get("metadata_status")
             or canonical.get("metadata_check_status"),
             "access": canonical.get("access") or canonical.get("access_level"),
@@ -629,6 +901,18 @@ def _deduplicate_technical(
     duplicates: list[dict[str, Any]] = []
     for source_id, members in grouped.items():
         canonical = members[0]
+        research_line_ids = sorted(
+            {
+                str(line_id)
+                for item in members
+                for line_id in (
+                    item.get("research_line_ids")
+                    if isinstance(item.get("research_line_ids"), list)
+                    else []
+                )
+                if str(line_id)
+            }
+        )
         entry = {
             "source_id": source_id,
             "title": canonical.get("title"),
@@ -640,6 +924,14 @@ def _deduplicate_technical(
             or canonical.get("updated_at"),
             "note_paths": sorted({str(item.get("note_path")) for item in members}),
             "topic_paths": sorted({str(item.get("topic_path")) for item in members}),
+            "research_line_ids": research_line_ids,
+            "support_roles": sorted(
+                {
+                    str(item.get("support_role"))
+                    for item in members
+                    if item.get("support_role")
+                }
+            ),
             "verification_status": canonical.get("verification_status")
             or canonical.get("status"),
             "inclusion_status": canonical.get("inclusion_status", "included"),

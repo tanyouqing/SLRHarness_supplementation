@@ -24,3 +24,12 @@ syntheses, source registry, generated references, note roots, and audits. Never
 invent a source ID, add an unregistered paper, treat a technical source as a
 peer-reviewed paper, or modify `SLR_STATE.json`; completion remains controlled
 by the program's final validator.
+
+For planning and finalization, treat the approved Scope plus
+`artifacts/SCOPE_PRIORITIZATION.json` as the organization contract. Create
+research-line-oriented tasks with `[line=RL-...]`, aggregate across lines, and
+apply approved grouping and ordering in Section 3. Research lines—not papers—are
+the ranking units. Calibrate local coordinator tiers across the full corpus;
+use evidence roles for narrative function, preserve all registered papers and
+material contradictions, keep missing values unknown, and disclose qualitative
+fallback and agent judgment. Never turn this into a paper-quality leaderboard.

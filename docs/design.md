@@ -2,6 +2,24 @@
 
 An agentic system for conducting reproducible literature reviews using CLI agents (Kiro, Claude Code, etc.) as autonomous research workers.
 
+## Research-line synthesis contract
+
+The enhanced pipeline restores the original separation between comparison
+dimensions and ranking/grouping criteria, while changing the ranking unit from
+individual papers to approved research lines or method families. Scope approval
+freezes groups, stable `RL-...` identifiers, priority factors, ordinal/numeric/
+weighted mode, ordering/tiebreaker, missing-data policy, and paper evidence
+roles. Python compiles this Markdown policy to
+`artifacts/SCOPE_PRIORITIZATION.json`; agents may assess but not rewrite it.
+
+Papers remain independently validated evidence with anchor, representative,
+supporting, contradictory, peripheral, or unassigned roles. Technical sources
+may support implementation understanding but do not become peer-reviewed
+evidence. The registry aggregates line coverage and preliminary ordering;
+the Finalizer performs corpus-wide calibration and varies narrative prominence
+by tier. Missing values are unranked rather than zero, emergent lines remain
+unapproved, and material contradictions override narrative priority in Section 4.
+
 ## 1. Motivation
 
 Literature reviews are labor-intensive: a typical systematic review takes 6–18 months with multiple reviewers. SLRHarness automates the mechanical parts — search, extraction, and synthesis — while keeping a human in the loop for scoping and quality judgment.

@@ -42,6 +42,32 @@ The scope agent produces content only. It must not edit lifecycle state,
 revision numbers, approval records, budgets, task registries, topic notes, or
 the final synthesis. Python code owns those transitions and validates outputs.
 
+## Research-Line Prioritization and Synthesis Policy
+
+The proposal must define research lines or method families as the primary
+ranking unit. Give each line a stable readable identifier using uppercase
+`RL-` plus letters, digits, and hyphens. IDs derive from names rather than
+discovery order and remain fixed after approval. Organize lines into one
+primary grouping and keep two contracts distinct:
+
+- comparison dimensions are facts extracted for a line or paper;
+- priority factors are cross-line judgments used by the manager/finalizer.
+
+Default to ordinal tiers: Core, Supporting, Peripheral, and Insufficient
+Evidence. Define scope relevance, evidence strength, and representativeness
+with operational rubrics; evidence strength is not method quality, paper count,
+or citation count. Use `numeric_dimension` or `weighted_composite` only when the
+scope defines comparable values, direction, factor ranges, weights, scoring
+rubrics, missing-data behavior, and a tiebreaker. Missing values remain unknown,
+never zero.
+
+Define primary/secondary ordering, a contradictory-evidence policy that always
+surfaces material counterevidence in final Section 4, and paper evidence roles:
+anchor, representative, supporting, contradictory, peripheral, and unassigned.
+These roles are not quality grades. The Approval Checklist explicitly asks the
+user to confirm groups, lines, factors, tier rubric, ordering/tiebreaker, and
+missing-data policy before approval.
+
 ## 1. Question Formulation
 
 ### For intervention / comparison reviews — use PICO

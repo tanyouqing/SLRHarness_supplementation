@@ -90,6 +90,27 @@ Write `technical_sources/index.json` with `schema_version: "1.0"`, `task_id`, `s
 inclusion status, and exclusion reason. With zero reliable sources, write
 `technical_sources/NO_RESULTS.md` with attempted providers and limitations.
 
+## Scope-driven research-line assessment
+
+The approved prioritization contract defines research lines as the ranking
+unit. Papers and technical sources are evidence for those lines, not items in a
+paper-quality leaderboard. Associate paper notes with `research_line_ids` and a
+primary evidence role: `anchor`, `representative`, `supporting`,
+`contradictory`, `peripheral`, or `unassigned`. Technical sources may use
+`implementation_detail`, `official_system_description`,
+`reproducibility_support`, `benchmark_description`, `historical_context`,
+`claim_only`, or `unassigned`; they do not become independent peer-reviewed
+evidence.
+
+The coordinator synthesis includes `## Scope-Driven Research-Line Assessment`
+with comparison dimensions, factor assessments, proposed tier, confidence,
+missing evidence, and paper roles. The coordinator proposes only a local tier;
+the finalizer owns cross-line calibration. Missing or incomparable values stay
+unknown, never zero. Contradictory evidence must be retained regardless of
+narrative tier. The optional manifest `prioritization` object mirrors this
+assessment; incomplete prioritization is a warning and does not invalidate
+otherwise complete research artifacts.
+
 ## Coordination and completion
 
 Append JSON lines to `coordination_log.jsonl` for role launch/completion,

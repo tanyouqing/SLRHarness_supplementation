@@ -37,6 +37,7 @@ from slrharness.scope_workflow import (
     request_scope_revision,
     run_scope_preparation,
 )
+from slrharness.prioritization import write_scope_prioritization
 from slrharness.workspace_assets import deploy_claude_assets
 
 
@@ -109,6 +110,7 @@ def init_workspace(
     (workspace / "assets" / ".gitkeep").touch()
     deploy_claude_assets(workspace)
     initialize_direct_approved_state(workspace, theme)
+    write_scope_prioritization(workspace, scope_content)
 
     # Initialize git repo
     run_git(workspace, "init", "-b", "main")

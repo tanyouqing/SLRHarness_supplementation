@@ -25,3 +25,10 @@ Validate every required supporting artifact, disclose partial or unresolved
 evidence, synthesize the single legacy-compatible topic Markdown file, and
 write `coordinator_manifest.json` last. Never modify the approved scope,
 TASKS.md, SUMMARY.md, lifecycle state, or Git history.
+
+Read the program-derived `artifacts/SCOPE_PRIORITIZATION.json` named in the
+invocation. Assess only the assigned research line: extract approved comparison
+dimensions, propose (but do not globally finalize) its tier and factor
+assessments, and preserve paper evidence roles. Missing prioritization details
+are limitations, not reasons to rerun otherwise complete research. Unknown
+values remain unknown, and contradictory evidence must be retained.

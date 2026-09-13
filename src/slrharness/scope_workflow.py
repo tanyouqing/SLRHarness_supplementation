@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import textwrap
@@ -23,6 +24,7 @@ from slrharness.contracts import (
     atomic_write_text,
     check_schema_version,
 )
+from slrharness.prioritization import write_scope_prioritization
 from slrharness.workspace_assets import deploy_claude_assets
 
 STATE_FILENAME = "SLR_STATE.json"
@@ -308,9 +310,21 @@ def build_scope_prompt(
         8. Preliminary Search Strategy (queries, sources, citation chasing,
            deduplication and version-merging rules)
         9. Proposed Evidence and Comparison Dimensions
-        10. Expected Deliverables
-        11. Known Limitations and Uncertainties
-        12. Approval Checklist
+        10. Research-Line Prioritization and Synthesis Policy. Propose research
+            groups and named research lines with stable `RL-` IDs; keep comparison
+            dimensions separate from priority factors; choose ordinal by default
+            unless an operational numeric/weighted rubric is justified; define
+            Ranking Unit, Primary Grouping, Ranking Mode, Priority Factors,
+            Priority Tiers, Primary and Secondary Ordering/tiebreaker,
+            Missing-Data Policy, Contradictory-Evidence Policy, and Paper Evidence
+            Roles (anchor, representative, supporting, contradictory, peripheral,
+            unassigned). Treat these as proposals pending user approval, never as
+            already confirmed policy.
+        11. Expected Deliverables
+        12. Known Limitations and Uncertainties
+        13. Approval Checklist, explicitly asking the user to confirm research
+            groups/lines, factors, tier rubric, ordering/tiebreaker, missing-data
+            policy, and the complete prioritization strategy
 
         {SOURCES_FILENAME} must remain useful even when no source was accessible.
         For every used or attempted source record title, author/institution, year,
@@ -329,15 +343,16 @@ def build_scope_prompt(
 
         SELF-CHECK BEFORE EXITING:
         - Both files exist, are non-empty, and contain substantive content.
-        - All twelve proposal areas are covered.
+        - All thirteen proposal areas are covered.
         - Unverified/model-knowledge claims are marked `[UNVERIFIED]`.
         - Retrieval limitations and failed attempts are disclosed.
         - No formal-review artifact or protected-state edit was made.
     """)
 
 
-def _validate_scope_outputs(workspace: Path) -> list[str]:
+def _validate_scope_outputs_detailed(workspace: Path) -> tuple[list[str], list[str]]:
     errors: list[str] = []
+    warnings: list[str] = []
     proposal = workspace / PROPOSAL_FILENAME
     sources = workspace / SOURCES_FILENAME
     if not proposal.is_file():
@@ -356,6 +371,7 @@ def _validate_scope_outputs(workspace: Path) -> list[str]:
             "exclusion criteria",
             "search strategy",
             "comparison dimensions",
+            "research-line prioritization and synthesis policy",
             "expected deliverables",
             "limitations",
             "approval checklist",
@@ -364,6 +380,45 @@ def _validate_scope_outputs(workspace: Path) -> list[str]:
         missing = [section for section in required if section not in lowered]
         if missing:
             errors.append("proposal missing sections: " + ", ".join(missing))
+        policy_match = re.search(
+            r"^##\s+(?:\d+[.)]\s*)?Research-Line Prioritization and Synthesis Policy\s*$"
+            r"(.*?)(?=^##\s+|\Z)",
+            text,
+            re.MULTILINE | re.DOTALL | re.IGNORECASE,
+        )
+        policy = policy_match.group(1) if policy_match else ""
+        for label in (
+            "Ranking Unit",
+            "Primary Grouping",
+            "Ranking Mode",
+            "Missing-Data Policy",
+        ):
+            if not re.search(rf"^###\s+(?:\d+[.)]\s*)?{re.escape(label)}\s*$", policy, re.MULTILINE | re.IGNORECASE):
+                errors.append(f"prioritization policy missing {label}")
+        if not re.search(r"^###\s+(?:\d+[.)]\s*)?(?:Priority Tiers|Primary Ordering)\s*$", policy, re.MULTILINE | re.IGNORECASE):
+            errors.append("prioritization policy missing Priority Tiers or equivalent ordering")
+        checklist = re.search(
+            r"^##\s+(?:\d+[.)]\s*)?.*Approval Checklist.*$\r?\n(.*?)(?=^##\s+|\Z)",
+            text,
+            re.MULTILINE | re.DOTALL | re.IGNORECASE,
+        )
+        checklist_text = checklist.group(1) if checklist else ""
+        if not re.search(r"prioriti[sz]|ranking|ordering", checklist_text, re.IGNORECASE):
+            errors.append("Approval Checklist does not ask the user to confirm prioritization")
+        if not re.search(r"RL-[A-Z0-9-]+", text):
+            warnings.append("proposal defines no explicit Research Line ID")
+        if not re.search(r"^###\s+(?:\d+[.)]\s*)?Secondary Ordering\s*$", policy, re.MULTILINE | re.IGNORECASE):
+            warnings.append("prioritization policy has no Secondary Ordering")
+        if not re.search(
+            r"^###\s+(?:\d+[.)]\s*)?Priority Factors\s*$",
+            policy,
+            re.MULTILINE | re.IGNORECASE,
+        ):
+            warnings.append("prioritization policy has no complete factor rubric")
+        if re.search(r"weighted_composite", policy, re.IGNORECASE) and not re.search(
+            r"\bweight\b", policy, re.IGNORECASE
+        ):
+            warnings.append("weighted ranking has no parseable weight rubric")
 
     if not sources.is_file():
         errors.append(f"missing {SOURCES_FILENAME}")
@@ -382,7 +437,12 @@ def _validate_scope_outputs(workspace: Path) -> list[str]:
     for dirname in ("topics", "assets"):
         if (workspace / dirname).exists():
             errors.append(f"scope agent created forbidden directory: {dirname}/")
-    return errors
+    return errors, warnings
+
+
+def _validate_scope_outputs(workspace: Path) -> list[str]:
+    """Compatibility wrapper returning only blocking scope errors."""
+    return _validate_scope_outputs_detailed(workspace)[0]
 
 
 def _archive_revision(workspace: Path, revision: int) -> None:
@@ -487,7 +547,7 @@ def run_scope_preparation(
         _commit_if_dirty(workspace, f"scope-{revision}: record preparation failure")
         return False
 
-    errors = _validate_scope_outputs(workspace)
+    errors, warnings = _validate_scope_outputs_detailed(workspace)
     if errors:
         reason = "; ".join(errors)
         _quarantine_forbidden_artifacts(workspace, revision)
@@ -515,6 +575,7 @@ def run_scope_preparation(
             "scope_agent_status": "COMPLETED",
             "generated_at": generated_at,
             "failure": None,
+            "validation_warnings": warnings,
             "formal_research_allowed": False,
         }
     )
@@ -600,6 +661,7 @@ def approve_scope(workspace: Path, revision: int) -> bool:
     (workspace / "assets").mkdir()
     (workspace / "topics" / ".gitkeep").touch()
     (workspace / "assets" / ".gitkeep").touch()
+    write_scope_prioritization(workspace, proposal)
 
     approved_at = utc_now()
     history = list(state.get("history", []))

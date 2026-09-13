@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import Any
 
 from slrharness.contracts import SCHEMA_VERSION, check_schema_version
+from slrharness.prioritization import (
+    PAPER_ROLES,
+    PRIORITIZATION_PATH,
+    PRIORITY_TIERS,
+    load_scope_prioritization,
+)
 
 LEGACY_WORKER = "legacy_worker"
 TOPIC_COORDINATOR = "topic_coordinator"
@@ -244,9 +250,21 @@ def build_coordinator_prompt(
     attempt: int,
     config: TopicExecutionConfig,
     retry_diagnostics: list[str] | None = None,
+    research_line_id: str | None = None,
+    prioritization_warnings: tuple[str, ...] = (),
 ) -> str:
     """Build the complete per-task contract for the top-level coordinator."""
     diagnostics = retry_diagnostics or []
+    contract = load_scope_prioritization(workspace)
+    line_id = research_line_id or "NOT_APPLICABLE"
+    line = next(
+        (
+            item
+            for item in contract.get("research_lines", [])
+            if isinstance(item, dict) and item.get("line_id") == line_id
+        ),
+        {},
+    )
     return f"""You are the single top-level Topic Coordinator for one bounded SLR task.
 
 TASK ID: {paths.task_id}
@@ -255,6 +273,14 @@ ATTEMPT: {attempt}
 TASK: {description}
 WORKSPACE: {workspace}
 APPROVED SCOPE: {workspace / "SCOPE.md"}
+APPROVED PRIORITIZATION CONTRACT: {workspace / PRIORITIZATION_PATH}
+RESEARCH LINE ID: {line_id}
+RESEARCH LINE NAME: {line.get("name", "Not available")}
+PRIMARY GROUP: {line.get("group", "Not available")}
+RANKING MODE: {contract.get("ranking_mode", "qualitative_fallback")}
+COMPARISON DIMENSIONS: {json.dumps(contract.get("comparison_dimensions", []), ensure_ascii=False)}
+PAPER EVIDENCE ROLES: {json.dumps(contract.get("paper_roles", list(PAPER_ROLES)))}
+PRIORITIZATION INPUT WARNINGS: {json.dumps(list(prioritization_warnings), ensure_ascii=False)}
 LEGACY-COMPATIBLE TOPIC SYNTHESIS: {paths.synthesis}
 SUPPORTING ARTIFACT ROOT: {paths.artifact_root}
 PROGRAM-OWNED TASK STATE: {paths.task_state}
@@ -318,12 +344,22 @@ REQUIRED FINAL OUTPUTS:
   `coordinator_manifest.json`.
 - The synthesis must distinguish papers from technical sources, link claims to
   supporting note paths, and disclose PARTIAL/UNRESOLVED metadata.
+- Add `## Scope-Driven Research-Line Assessment` to the synthesis with the
+  Research Line ID/name/group, ranking applicability, locally proposed tier,
+  confidence, missing ranking evidence, comparison-dimension values, priority
+  factor assessments, and paper evidence roles. `not_applicable` is allowed
+  with a reason. This is a local assessment only; never claim a globally final
+  rank. Missing values remain unknown rather than zero.
 - Write the manifest last, after validating all other outputs. Its task_id
   must be exactly `{paths.task_id}`; status must be COMPLETE, PARTIAL,
   or FAILED; paths must be workspace-relative. Include topic_synthesis,
   academic_worker.index_path and paper_count,
   metadata_checker.audit_path and overall_status,
   technical_worker.index_path and source_count, limitations, and completed_at.
+- The manifest may add `prioritization` with research_line_id/name/group,
+  ranking_applicability, proposed_tier, confidence, comparison_values,
+  factor_assessments, paper_roles, supporting_source_ids, missing_evidence,
+  and warnings. Prioritization omissions are non-fatal and must be disclosed.
 - Every JSON artifact above must include `"schema_version": "1.0"`.
 
 MCP AND NETWORK FALLBACK:
@@ -419,10 +455,13 @@ def validate_coordinator_outputs(
     )
     errors: list[str] = []
     warnings: list[str] = []
+    synthesis_text = ""
     if not paths.synthesis.is_file():
         errors.append(f"missing topic synthesis: {paths.synthesis}")
-    elif len(paths.synthesis.read_text(encoding="utf-8").strip()) < 200:
-        errors.append("topic synthesis is empty or only a placeholder")
+    else:
+        synthesis_text = paths.synthesis.read_text(encoding="utf-8")
+        if len(synthesis_text.strip()) < 200:
+            errors.append("topic synthesis is empty or only a placeholder")
 
     manifest = _load_json(paths.manifest, "coordinator manifest", errors)
     if manifest is None:
@@ -435,6 +474,48 @@ def validate_coordinator_outputs(
             f"manifest task_id mismatch: expected {paths.task_id}, "
             f"got {manifest.get('task_id')!r}"
         )
+    contract = load_scope_prioritization(workspace)
+    known_lines = {
+        str(item.get("line_id"))
+        for item in contract.get("research_lines", [])
+        if isinstance(item, dict) and item.get("line_id")
+    }
+    prioritization = manifest.get("prioritization")
+    if not isinstance(prioritization, dict):
+        warnings.append("prioritization: manifest assessment is missing")
+    else:
+        line_id = str(prioritization.get("research_line_id") or "").upper()
+        if not line_id:
+            warnings.append("prioritization: research_line_id is missing")
+        elif line_id != "NOT_APPLICABLE" and line_id not in known_lines:
+            warnings.append(f"prioritization: unknown Research Line ID {line_id}")
+        applicability = str(
+            prioritization.get("ranking_applicability") or ""
+        ).lower().replace(" ", "_")
+        if applicability and applicability not in {"applicable", "not_applicable"}:
+            warnings.append("prioritization: invalid ranking_applicability")
+        tier = str(prioritization.get("proposed_tier") or "").strip()
+        if applicability != "not_applicable" and not tier:
+            warnings.append("prioritization: proposed tier is missing")
+        elif tier and tier.lower() not in {value.lower() for value in PRIORITY_TIERS}:
+            warnings.append(f"prioritization: invalid proposed tier {tier!r}")
+        roles = prioritization.get("paper_roles") or {}
+        if isinstance(roles, dict):
+            for paper_id, role in roles.items():
+                if str(role).lower() not in PAPER_ROLES:
+                    warnings.append(
+                        f"prioritization: invalid paper role {role!r} for {paper_id}"
+                    )
+        elif roles:
+            warnings.append("prioritization: paper_roles must be an object")
+    if synthesis_text and not re.search(
+        r"^##\s+Scope-Driven Research-Line Assessment\s*$",
+        synthesis_text,
+        re.MULTILINE | re.IGNORECASE,
+    ):
+        warnings.append("prioritization: synthesis line assessment is missing")
+    if contract.get("compile_status") == "PARTIAL":
+        warnings.append("prioritization: approved scope contract is PARTIAL")
     if require_coordination_log and not paths.coordination_log.is_file():
         errors.append("missing coordination_log.jsonl")
     correction_queue = paths.audit_dir / "correction_requests.jsonl"
@@ -711,13 +792,16 @@ def validate_coordinator_outputs(
                     errors.append(f"invalid technical note path: {note_value!r}")
 
     substantive_warnings = [
-        warning for warning in warnings if "schema_version" not in warning
+        warning
+        for warning in warnings
+        if "schema_version" not in warning
+        and not warning.startswith("prioritization:")
     ]
     effective_status = (
         "PARTIAL" if substantive_warnings or status == "PARTIAL" else status
     )
-    if warnings and not allow_partial:
-        errors.extend(warnings)
+    if substantive_warnings and not allow_partial:
+        errors.extend(substantive_warnings)
     accepted = not errors and effective_status in ("COMPLETE", "PARTIAL")
     return CoordinatorValidation(
         accepted,

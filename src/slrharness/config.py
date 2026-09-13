@@ -11,6 +11,7 @@ from typing import Any
 from slrharness.agent_backends import available_backends
 from slrharness.contracts import SCHEMA_VERSION, check_schema_version
 from slrharness.finalization import FinalizationConfig
+from slrharness.prioritization import PrioritizationConfig
 from slrharness.scope_workflow import ScopeConfig
 from slrharness.topic_execution import TopicExecutionConfig
 
@@ -29,6 +30,7 @@ class HarnessConfig:
     scope: ScopeConfig
     topic_execution: TopicExecutionConfig
     finalization: FinalizationConfig
+    prioritization: PrioritizationConfig
     backend: str
     fixed_contracts: dict[str, dict[str, Any]]
 
@@ -38,6 +40,7 @@ class HarnessConfig:
             "scope": asdict(self.scope),
             "topic_execution": asdict(self.topic_execution),
             "finalization": asdict(self.finalization),
+            "prioritization": asdict(self.prioritization),
             "backends": {"default": self.backend},
             **self.fixed_contracts,
         }
@@ -69,6 +72,7 @@ def load_config(path: Path) -> HarnessConfig:
         "scope",
         "topic_execution",
         "finalization",
+        "prioritization",
         "backends",
         *FIXED_SECTIONS,
     }
@@ -79,6 +83,7 @@ def load_config(path: Path) -> HarnessConfig:
         scope = ScopeConfig(**_section(data, "scope"))
         topic = TopicExecutionConfig(**_section(data, "topic_execution"))
         finalization = FinalizationConfig(**_section(data, "finalization"))
+        prioritization = PrioritizationConfig(**_section(data, "prioritization"))
     except TypeError as exc:
         raise ValueError(f"unknown or invalid configuration field: {exc}") from exc
     backends = _section(data, "backends")
@@ -88,4 +93,4 @@ def load_config(path: Path) -> HarnessConfig:
     if backend not in available_backends():
         raise ValueError(f"unknown agent backend: {backend}")
     fixed = {name: _section(data, name) for name in sorted(FIXED_SECTIONS)}
-    return HarnessConfig(scope, topic, finalization, backend, fixed)
+    return HarnessConfig(scope, topic, finalization, prioritization, backend, fixed)
