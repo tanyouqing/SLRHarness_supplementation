@@ -155,7 +155,18 @@ class ClaudeCodeBackend:
         prompt: str,
         cwd: Path,
     ) -> list[str]:
-        command = ["claude", "--dangerously-skip-permissions"]
+        # Disable Claude Code's "background tasks running after 600s; terminating"
+        # ceiling. The harness relies on long-running subagents (paper workers,
+        # metadata checkers) that often exceed 10 minutes when fetching and
+        # reading many papers; the harness enforces its own per-attempt timeouts
+        # (coordinator_timeout, academic_max_turns, etc.) so we never want
+        # Claude itself to kill subagents silently mid-flight.
+        command = [
+            "env",
+            "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0",
+            "claude",
+            "--dangerously-skip-permissions",
+        ]
         if agent_name:
             command.extend(["--agent", agent_name])
         command.extend(["-p", prompt])

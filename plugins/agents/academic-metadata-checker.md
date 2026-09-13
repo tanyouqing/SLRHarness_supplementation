@@ -10,6 +10,7 @@ tools:
   - WebFetch
   - mcp__arxiv__*
   - mcp__scholarly__*
+  - mcp__tavily__*
 skills:
   - slr-topic-research
 maxTurns: 20

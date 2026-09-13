@@ -456,6 +456,15 @@ def validate_coordinator_outputs(
             except json.JSONDecodeError:
                 errors.append(f"invalid correction request JSON on line {line_number}")
                 continue
+            # Tolerate agent outputs that serialize an empty list `[]` or a
+            # comment line (already filtered above) instead of an empty queue:
+            # skip non-dict entries rather than crashing the whole validator.
+            if not isinstance(request, dict):
+                warnings.append(
+                    f"skipping non-object correction request on line {line_number} "
+                    f"(got {type(request).__name__})"
+                )
+                continue
             request_id = str(request.get("request_id") or "")
             request_status = str(request.get("status") or "").lower()
             if not request_id or request_status not in {
@@ -580,10 +589,12 @@ def validate_coordinator_outputs(
             for item in papers:
                 note_value = item.get("note_path") if isinstance(item, dict) else None
                 note_path = _resolve_manifest_path(workspace, note_value)
+                topics_root = (workspace / "topics").resolve()
                 if (
                     note_path is None
-                    or not note_path.is_relative_to(paths.paper_dir.resolve())
                     or not note_path.is_file()
+                    or not note_path.is_relative_to(topics_root)
+                    or note_path.suffix.lower() != ".md"
                 ):
                     errors.append(f"invalid paper note path: {note_value!r}")
 
@@ -683,10 +694,12 @@ def validate_coordinator_outputs(
             for item in sources:
                 note_value = item.get("note_path") if isinstance(item, dict) else None
                 note_path = _resolve_manifest_path(workspace, note_value)
+                topics_root = (workspace / "topics").resolve()
                 if (
                     note_path is None
-                    or not note_path.is_relative_to(paths.technical_dir.resolve())
                     or not note_path.is_file()
+                    or not note_path.is_relative_to(topics_root)
+                    or note_path.suffix.lower() != ".md"
                 ):
                     errors.append(f"invalid technical note path: {note_value!r}")
 
