@@ -40,9 +40,110 @@ def test_parse_pending_tasks_picks_up_all_separators(tmp_path: Path) -> None:
         "topics/efficiency/pruning",
         "topics/efficiency/quantization",
         "topics/benchmarks/latency",
-        "topics/scaling/multi-gpu",
-        "topics/distillation/survey",
     }
+
+
+def test_parse_pending_tasks_excludes_blocked_and_backlog(tmp_path: Path) -> None:
+    tasks_md = tmp_path / "TASKS.md"
+    tasks_md.write_text(SAMPLE_TASKS, encoding="utf-8")
+
+    paths = {task.topic_path for task in parse_pending_tasks(tasks_md)}
+
+    assert "topics/scaling/multi-gpu" not in paths
+    assert "topics/distillation/survey" not in paths
+
+
+def test_parse_pending_tasks_uses_highest_numbered_round_only(tmp_path: Path) -> None:
+    tasks_md = tmp_path / "TASKS.md"
+    tasks_md.write_text(
+        """\
+# Tasks
+
+## Round 8
+### Pending
+- [ ] topics/current/one -- Current task one
+- [ ] topics/current/two -- [mode=topic_coordinator] Current task two
+
+### Blocked
+- [ ] topics/current/blocked -- Do not dispatch
+
+## Round 3
+### Pending
+- [ ] topics/old/task -- Do not dispatch an older round
+
+## Backlog
+- [ ] topics/future/task -- Do not dispatch backlog
+""",
+        encoding="utf-8",
+    )
+
+    assert parse_pending_tasks(tasks_md) == [
+        Task("topics/current/one", "Current task one"),
+        Task("topics/current/two", "Current task two", "topic_coordinator"),
+    ]
+
+
+def test_parse_pending_tasks_does_not_fall_back_to_older_round(tmp_path: Path) -> None:
+    tasks_md = tmp_path / "TASKS.md"
+    tasks_md.write_text(
+        """\
+## Round 1
+### Pending
+- [ ] topics/old/task -- Still unchecked historically
+
+## Round 2
+### Pending
+
+### Blocked
+- [ ] topics/new/blocked -- Not runnable
+""",
+        encoding="utf-8",
+    )
+
+    assert parse_pending_tasks(tasks_md) == []
+
+
+def test_parse_pending_tasks_stays_inside_latest_round_section(tmp_path: Path) -> None:
+    tasks_md = tmp_path / "TASKS.md"
+    tasks_md.write_text(
+        """\
+## Round 2
+### Completed
+- [x] topics/current/done -- Finished
+
+## Manual Queue
+### Pending
+- [ ] topics/manual/task -- Not part of round 2
+""",
+        encoding="utf-8",
+    )
+
+    assert parse_pending_tasks(tasks_md) == []
+
+
+def test_parse_pending_tasks_supports_legacy_pending_section(tmp_path: Path) -> None:
+    tasks_md = tmp_path / "TASKS.md"
+    tasks_md.write_text(
+        """\
+# Tasks
+### Pending
+- [ ] topics/legacy/pending -- Runnable
+### Blocked
+- [ ] topics/legacy/blocked -- Not runnable
+""",
+        encoding="utf-8",
+    )
+
+    assert parse_pending_tasks(tasks_md) == [Task("topics/legacy/pending", "Runnable")]
+
+
+def test_parse_pending_tasks_supports_legacy_flat_file(tmp_path: Path) -> None:
+    tasks_md = tmp_path / "TASKS.md"
+    tasks_md.write_text(
+        "# Tasks\n- [ ] topics/legacy/flat -- Runnable\n", encoding="utf-8"
+    )
+
+    assert parse_pending_tasks(tasks_md) == [Task("topics/legacy/flat", "Runnable")]
 
 
 def test_parse_pending_tasks_skips_completed(tmp_path: Path) -> None:

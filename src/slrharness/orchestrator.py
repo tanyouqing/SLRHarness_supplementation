@@ -129,10 +129,45 @@ def parse_pending_tasks(tasks_md: Path) -> list[Task]:
       - [ ] topics/foo/bar - description
       - [ ] topics/foo/bar: description
 
-    Only the first 'Pending' section under the latest round is consumed.
+    When numbered round sections exist, only the ``### Pending`` subsection
+    under the highest-numbered round is consumed.  This prevents unchecked
+    entries in older rounds, ``Blocked``, or ``Backlog`` sections from being
+    dispatched.  Pre-round legacy files remain supported: their Pending
+    subsection is preferred, with a whole-file fallback for the oldest flat
+    checkbox format.
     """
     content = tasks_md.read_text(encoding="utf-8")
     tasks: list[Task] = []
+
+    round_pattern = re.compile(
+        r"^\s*##\s+Round\s+(\d+)\s*$", re.MULTILINE | re.IGNORECASE
+    )
+    round_matches = list(round_pattern.finditer(content))
+    if round_matches:
+        # Use the highest round number rather than merely the last heading so
+        # a malformed/out-of-order historical section cannot become active.
+        active_round = max(
+            enumerate(round_matches), key=lambda item: (int(item[1].group(1)), item[0])
+        )[1]
+        following_section = re.search(
+            r"^\s*##\s+.+$", content[active_round.end() :], re.MULTILINE
+        )
+        round_end = (
+            active_round.end() + following_section.start()
+            if following_section is not None
+            else len(content)
+        )
+        round_content = content[active_round.end() : round_end]
+        pending_content = _pending_section(round_content)
+        if pending_content is None:
+            return []
+    else:
+        # Compatibility for workspaces created before numbered rounds were
+        # introduced.  If they have headings, respect Pending boundaries;
+        # otherwise retain support for a flat list of checkboxes.
+        pending_content = _pending_section(content)
+        if pending_content is None:
+            pending_content = content
 
     # Match checkbox lines with a topic path prefix. Accept several separators:
     # "topics/foo/bar — desc", "topics/foo/bar - desc", "topics/foo/bar -- desc",
@@ -151,7 +186,7 @@ def parse_pending_tasks(tasks_md: Path) -> list[Task]:
         """,
         re.MULTILINE | re.VERBOSE,
     )
-    for match in pattern.finditer(content):
+    for match in pattern.finditer(pending_content):
         topic_path = match.group(1).rstrip("/")
         description = match.group(2).strip()
         execution_mode = None
@@ -170,6 +205,22 @@ def parse_pending_tasks(tasks_md: Path) -> list[Task]:
         )
 
     return tasks
+
+
+def _pending_section(content: str) -> str | None:
+    """Return one Markdown ``### Pending`` body, bounded by peer headings."""
+    pending = re.search(r"^\s*###\s+Pending\s*$", content, re.MULTILINE | re.IGNORECASE)
+    if pending is None:
+        return None
+    following_heading = re.search(
+        r"^\s*#{1,3}\s+.+$", content[pending.end() :], re.MULTILINE
+    )
+    end = (
+        pending.end() + following_heading.start()
+        if following_heading is not None
+        else len(content)
+    )
+    return content[pending.end() : end]
 
 
 def current_round(workspace: Path) -> int:

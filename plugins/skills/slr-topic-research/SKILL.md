@@ -70,6 +70,10 @@ The checker must not edit notes. Append JSON objects to
 `audits/correction_requests.jsonl` containing request ID, note path, field,
 observed value, suggested value, source, status, and timestamps. The academic
 worker applies pending requests; the checker independently re-checks them.
+The queue is strict JSONL: every non-empty line is exactly one JSON object.
+Never write comments, arrays, or explanatory prose. If there are no requests
+and the queue does not yet exist, create an empty file; during later checks,
+preserve existing request history and do not append an empty placeholder.
 
 ## Technical-source artifacts
 

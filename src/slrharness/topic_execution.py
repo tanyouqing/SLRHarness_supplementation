@@ -327,10 +327,14 @@ REQUIRED FINAL OUTPUTS:
 - Every JSON artifact above must include `"schema_version": "1.0"`.
 
 MCP AND NETWORK FALLBACK:
-- Academic and metadata roles prefer configured scholarly/arXiv tools, then
-  WebSearch/WebFetch. Technical work prefers configured Tavily, then
-  WebSearch/WebFetch. Missing MCPs, rate limits, empty results, inaccessible
-  pages, and missing Tavily keys are non-fatal.
+- Academic and metadata roles use configured scholarly/arXiv tools first. For
+  an arXiv operation returning HTTP 429, make at most two attempts in total,
+  then switch to Tavily. Also switch to Tavily when scholarly/arXiv tools are
+  absent or fail. Only if Tavily fails, use WebSearch/WebFetch. The metadata
+  checker may treat Tavily search results themselves as authoritative evidence.
+  Technical work prefers configured Tavily, then WebSearch/WebFetch. Missing
+  MCPs, rate limits, empty results, inaccessible pages, and missing Tavily keys
+  are non-fatal.
 - If retrieval is unavailable, write explicit no-result/limited-access records.
   Never fabricate papers, metadata, access depth, sources, or results. Mark
   unverifiable content `[UNVERIFIED]`.
@@ -449,16 +453,19 @@ def validate_coordinator_outputs(
         for line_number, line in enumerate(
             correction_queue.read_text(encoding="utf-8").splitlines(), start=1
         ):
-            if not line.strip():
+            stripped_line = line.strip()
+            if not stripped_line or stripped_line.startswith("//"):
                 continue
             try:
-                request = json.loads(line)
+                request = json.loads(stripped_line)
             except json.JSONDecodeError:
                 errors.append(f"invalid correction request JSON on line {line_number}")
                 continue
-            # Tolerate agent outputs that serialize an empty list `[]` or a
-            # comment line (already filtered above) instead of an empty queue:
-            # skip non-dict entries rather than crashing the whole validator.
+            # Older agents sometimes serialized an empty queue as `[]`.
+            # Accept that one legacy representation without downgrading an
+            # otherwise complete task; all new output follows strict JSONL.
+            if request == []:
+                continue
             if not isinstance(request, dict):
                 warnings.append(
                     f"skipping non-object correction request on line {line_number} "
