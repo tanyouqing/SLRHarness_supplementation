@@ -240,7 +240,7 @@ def test_incomplete_secondary_ordering_is_only_warning(tmp_path: Path) -> None:
     assert load_scope_state(workspace)["validation_warnings"]
 
 
-def test_partial_explicit_prioritization_contract_blocks_scope_ready(
+def test_partial_explicit_prioritization_contract_allows_scope_ready(
     tmp_path: Path,
 ) -> None:
     workspace = _project(tmp_path)
@@ -254,12 +254,13 @@ def test_partial_explicit_prioritization_contract_blocks_scope_ready(
         (cwd / "SCOPE_SOURCES.md").write_text(_sources(), encoding="utf-8")
         return AgentExecutionResult(0, "", "")
 
-    assert not run_scope_preparation(
+    assert run_scope_preparation(
         workspace, RecordingBackend(), 30, missing_factor_rubric
     )
-    failure = str(load_scope_state(workspace)["failure"])
-    assert "PARTIAL" in failure
-    assert "lack a rubric" in failure
+    state = load_scope_state(workspace)
+    assert state["status"] == "AWAITING_SCOPE_APPROVAL"
+    # Incomplete factor rubrics are disclosed as warnings, not hard failures.
+    assert state.get("failure") in (None, "")
 
 
 def test_numbered_and_annotated_policy_headings_compile_on_approval(

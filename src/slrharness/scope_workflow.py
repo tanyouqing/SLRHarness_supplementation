@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import re
 import shutil
 import subprocess
@@ -487,19 +487,18 @@ def _validate_scope_outputs_detailed(workspace: Path) -> tuple[list[str], list[s
             "Ranking Mode",
             "Missing-Data Policy",
         ):
-            # Accept standalone labels and compound headings such as
-            # "### 10.1 Ranking unit and primary grouping".
+            # Accept standalone or compound headings, or a prose mention in the
+            # prioritization policy section.
             if not re.search(
-                rf"^###\s+(?:[\d.)]+\s+)?(?:{re.escape(label)}\b|"
-                rf"[^\n]*(?:\band\b|[&/])\s*{re.escape(label)}\b)",
+                rf"^###\s+[^\n]*{re.escape(label)}",
                 policy,
                 re.MULTILINE | re.IGNORECASE,
-            ):
-                errors.append(f"prioritization policy missing {label}")
+            ) and not re.search(re.escape(label), policy, re.IGNORECASE):
+                warnings.append(
+                    f"prioritization policy has no explicit {label} heading"
+                )
         if not re.search(
-            r"^###\s+(?:[\d.)]+\s+)?(?:Priority Tiers|Primary Ordering)\b|"
-            r"^###\s+(?:[\d.)]+\s+)?[^\n]*(?:\band\b|[&/])\s*"
-            r"(?:Priority Tiers|Primary Ordering)\b",
+            r"Priority Tiers|Primary Ordering|Tier Rubric|\bCore\b.*\bSupporting\b",
             policy,
             re.MULTILINE | re.IGNORECASE,
         ):
@@ -547,9 +546,15 @@ def _validate_scope_outputs_detailed(workspace: Path) -> tuple[list[str], list[s
                 diagnostics = compiled.get("diagnostics") or compiled.get(
                     "warnings", []
                 )
-                errors.append(
+                # Scope gate is intentionally permissive: PARTIAL contracts may be
+                # approved and disclosed downstream instead of blocking prepare.
+                warnings.append(
                     "prioritization contract is PARTIAL: "
                     + "; ".join(str(item) for item in diagnostics)
+                )
+            if not compiled.get("research_lines"):
+                errors.append(
+                    "prioritization contract could not recover any research lines"
                 )
 
     if not sources.is_file():
