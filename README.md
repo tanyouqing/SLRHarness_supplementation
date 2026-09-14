@@ -222,9 +222,9 @@ that the field has no literature.
 
 ## Coordinated topic execution (Claude Code)
 
-The original single-worker path remains the default for old commands and
-workspaces. To upgrade each selected topic task to one deterministic top-level
-Claude Code coordinator, run:
+The structured scheduler is the canonical path for newly planned topic tasks;
+the original single-worker and coordinator artifacts remain readable for
+legacy migration. Run:
 
 ```bash
 uv run python -m slrharness.orchestrator run \
@@ -236,56 +236,37 @@ uv run python -m slrharness.orchestrator run \
   --coordinator-retries 1
 ```
 
-The orchestrator starts exactly one `claude --agent topic-coordinator -p ...`
-process for each selected topic and owns its task ID, attempt, timeout, PID,
-exit status, validation, retry, and resume decision. Inside that one session,
-the coordinator launches `academic-paper-worker` and
-`technical-source-worker` concurrently as ordinary named subagents, then runs
-`academic-metadata-checker` after the paper manifest exists. The checker only
-audits publication identity and metadata.
+The Python orchestrator is the stage scheduler. It launches the academic and
+technical workers concurrently, imports their staging Markdown to canonical
+paths, then runs metadata checking, exact-field repair and re-check, and finally
+invokes `topic-coordinator` only as a content synthesizer. The coordinator does
+not launch agents or own lifecycle decisions.
 
-This mode deliberately does not enable Claude Code Agent Teams. Ordinary
-subagents currently do not expose team peer `SendMessage`, so corrections use
-the durable `audits/correction_requests.jsonl` queue: the coordinator invokes
-the academic worker to apply pending requests, then invokes the checker again,
-for at most `--max-correction-rounds` rounds. This is also the mandatory
-fallback if messaging capabilities change or fail in a later CLI version.
+Checker output is observation data. The Harness converts mismatches into the
+single program-owned `artifacts/ISSUES.jsonl` ledger, dispatches exact repairs,
+checks the note diff, and exclusively controls `open → repair_dispatched →
+applied → verified_closed/unresolved`. Resume state lives in `SLR_STATE.json`.
 
 Each task keeps its Manager-compatible primary synthesis and an adjacent
 supporting tree:
 
 ```text
-topics/<topic>/<subtopic>.md                 # primary Manager input
-topics/<topic>/<subtopic>/
-├── task.json                               # program-owned attempt/process state
-├── task_contract.json                      # program-owned paths and identity
-├── papers/index.json                       # or papers/NO_RESULTS.md
-├── papers/<stable-paper-slug>.md
-├── technical_sources/index.json            # or NO_RESULTS.md
-├── technical_sources/<stable-source-slug>.md
-├── audits/metadata_findings.jsonl           # checker observations
-├── audits/metadata_check.json
-├── audits/correction_requests.jsonl
-├── audits/artifact_normalization.json
-├── audits/checkpoint.json
-├── coordination_log.jsonl
-└── coordinator_manifest.json
+SLR_STATE.json                              # canonical lifecycle/task/invocation state
+TASKS.md                                    # rendered human-readable projection
+artifacts/SCOPE_CONTRACT.json               # approved machine scope
+artifacts/ISSUES.jsonl                      # canonical issue event ledger
+artifacts/staging/<invocation-id>/           # non-canonical agent output
+topics/<topic>/<subtopic>.md                 # topic synthesis
+topics/<topic>/<subtopic>/papers/*.md        # canonical paper notes
+topics/<topic>/<subtopic>/technical_sources/*.md
+sections/01-terminology-scope.md             # through section 05
+SUMMARY.md                                   # deterministic program assembly
 ```
 
-Workers now own semantic evidence only: academic/technical Markdown notes,
-metadata findings and correction requests. The Coordinator owns the topic
-synthesis and coordination log. After every process outcome—including timeout
-or nonzero exit—the Python Artifact Compiler discovers notes inside that task
-root, safely flattens recoverable `papers/notes/` or
-`technical_sources/notes/` paths, generates stable IDs, recomputes counts, and
-writes the canonical indexes, metadata audit, checkpoint, normalization report,
-and manifest. Agent-written counts, task IDs, and manifests are treated as
-legacy input rather than authoritative state.
-
-Valid complete artifacts left by a timed-out/nonzero Coordinator are accepted
-as `PARTIAL` by default. A retry reads `audits/checkpoint.json` and is told to
-complete only `missing_steps`; existing notes are preserved. Disable recovery
-with `--no-accept-valid-artifacts-after-process-failure`.
+New workspaces no longer generate per-topic task/contract/manifest/checkpoint,
+coordination logs, metadata queues, or Markdown indexes. Legacy workspaces can
+still load them once during migration; they are then read-only. Agent-authored
+IDs, counts, statuses, timestamps, and canonical paths are diagnostic only.
 
 To inspect or rebuild one topic without Claude or tmux:
 

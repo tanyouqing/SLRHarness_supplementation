@@ -97,6 +97,35 @@ def test_compound_ranking_heading_prefers_its_research_line_table() -> None:
     ]
 
 
+def test_policy_at_a_glance_and_decorated_headers_compile() -> None:
+    scope = _scope().replace(
+        "### Ranking Unit\nresearch_line",
+        "### 10.0 Prioritization Policy at a Glance\n"
+        "| Contract element | Proposed value |\n|---|---|\n"
+        "| **Ranking Unit** | the research line (`RL-<NAME>`) |\n"
+        "| **Primary Grouping** | modification locus |\n"
+        "| **Ranking Mode** | `ordinal_tiers` (default) |\n"
+        "| **Priority Tiers** | Core → Supporting → Peripheral → Insufficient Evidence |\n"
+        "| **Primary Ordering** | tier |\n"
+        "| **Secondary Ordering (tiebreakers)** | year desc |\n"
+        "| **Missing-Data Policy** | unknown is not zero |\n\n"
+        "### 10.1 Ranking Unit\nresearch_line",
+    ).replace(
+        "| Factor ID | Factor | Meaning | Operational rubric | Evidence required |",
+        "| ID | Factor | Meaning | Operational rubric (low → high) | Evidence required |",
+    ).replace(
+        "| Research Line ID | Research Line | Primary Group | Definition | Main Scope Question | Priority Tier |",
+        "| Line ID | Name | Group | One-line definition | Main Scope Question | Expected tier (provisional) |",
+    )
+    contract = compile_scope_prioritization(scope)
+    assert contract["compile_status"] == "COMPLETE"
+    assert contract["ranking_mode"] == "ordinal"
+    assert len(contract["research_lines"]) == 2
+    assert all(line["definition"] for line in contract["research_lines"])
+    assert contract["factors"][0]["factor_id"] == "REL"
+    assert contract["factors"][0]["rubric"] == "ordinal rubric"
+
+
 def test_legacy_scope_degrades_without_zero_values() -> None:
     contract = compile_scope_prioritization(
         "## Ranking & Grouping Criteria\nGroup topics by mechanism and order qualitatively."

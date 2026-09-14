@@ -6,7 +6,11 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
-from slrharness.artifact_compiler import compile_topic_artifacts
+from slrharness.artifact_compiler import (
+    _pending_corrections,
+    compile_topic_artifacts,
+    correction_request_id,
+)
 from slrharness.orchestrator import (
     CoordinatorProcessResult,
     Task,
@@ -228,6 +232,52 @@ def test_timeout_with_complete_artifacts_is_accepted_as_partial(
     assert rebuilt.status == "PARTIAL"
     assert rebuilt.manifest["process"]["timed_out"] is True
 
+
+def test_correction_events_are_append_only_latest_state() -> None:
+    first = correction_request_id(
+        "topics/a/papers/p.md", "doi", "https://doi.org/10.1234/ABC"
+    )
+    second = correction_request_id(
+        "topics/a/papers/p.md", "doi", "10.1234/abc"
+    )
+    assert first == second
+
+
+def test_applied_correction_remains_open_until_resolved(tmp_path: Path) -> None:
+    queue = tmp_path / "correction_requests.jsonl"
+    events = [
+        {"request_id": "CR-ONE", "field": "title", "status": "pending"},
+        {"request_id": "CR-ONE", "field": "title", "status": "applied"},
+        {"request_id": "CR-TWO", "field": "year", "status": "applied"},
+        {"request_id": "CR-TWO", "field": "year", "status": "verified"},
+    ]
+    queue.write_text(
+        "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+    )
+    report = {"warnings": []}
+    open_requests = _pending_corrections(queue, report)
+    assert [item["request_id"] for item in open_requests] == ["CR-ONE"]
+
+
+def test_compiler_rejects_truncated_jsonl_history(tmp_path: Path) -> None:
+    paths = topic_paths(tmp_path, "topics/recovery/history")
+    paths.audit_dir.mkdir(parents=True)
+    paths.metadata_findings.write_text(
+        '{"note_path":"old.md","status":"PASS"}\n', encoding="utf-8"
+    )
+    initialize_topic_attempt(
+        paths, "history", 1, 1,
+        replace(TopicExecutionConfig(), mode=TOPIC_COORDINATOR),
+    )
+    paths.metadata_findings.write_text("", encoding="utf-8")
+    result = compile_topic_artifacts(
+        tmp_path,
+        paths,
+        replace(TopicExecutionConfig(), mode=TOPIC_COORDINATOR),
+        CoordinatorProcessResult(True, 0, False),
+    )
+    assert not result.compiled
+    assert any("truncated or overwritten" in error for error in result.errors)
 
 def test_runner_accepts_valid_timeout_artifacts_as_partial(tmp_path: Path) -> None:
     task = Task(

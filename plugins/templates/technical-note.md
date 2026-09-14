@@ -1,6 +1,5 @@
 ---
 artifact_type: technical_source_note
-source_id: "<optional agent-proposed ID>"
 title: "<resource title>"
 organization: "<author or organization>"
 resource_type: official_documentation

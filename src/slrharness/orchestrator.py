@@ -28,18 +28,36 @@ from slrharness.agent_backends import (
     available_backends,
     get_backend,
 )
-from slrharness.artifact_compiler import compile_topic_artifacts
-from slrharness.contracts import SCHEMA_VERSION, atomic_write_json
+from slrharness.artifact_compiler import compile_topic_artifacts, import_staged_notes
+from slrharness.contracts import AgentInvocation, SCHEMA_VERSION, atomic_write_json
+from slrharness.control_plane import (
+    apply_verification_observation,
+    blocking_issue_ids,
+    current_issues,
+    ingest_metadata_observation,
+    migrate_legacy_tasks,
+    now as control_now,
+    record_invocation,
+    register_tasks,
+    staging_directory,
+    topic_tasks as state_topic_tasks,
+    transition_issue,
+    update_topic_task,
+    update_round_status,
+)
 from slrharness.finalization import (
     FINAL_AUDIT_PATH,
     PREFINAL_AUDIT_PATH,
     FinalizationConfig,
     aggregate_and_audit,
-    build_finalizer_prompt,
+    blocking_gap_summary,
     build_prefinal_prompt,
     build_repair_plan_prompt,
+    collect_blocking_gaps,
+    delivery_statistics,
     ensure_stable_repair_tasks,
     finalization_state,
+    merge_semantic_prefinal_audit,
     update_finalization_state,
     validate_final_report,
     validate_prefinal_audit,
@@ -51,11 +69,18 @@ from slrharness.prioritization import (
     fallback_research_line_id,
     load_scope_prioritization,
 )
+from slrharness.report_sections import (
+    assemble_report,
+    build_report_packet,
+    build_section_prompt,
+    validate_section,
+)
 from slrharness.scope_workflow import (
     formal_research_block_reason,
     load_scope_state,
     state_path,
 )
+from slrharness.source_registry import normalize_arxiv, normalize_doi, parse_frontmatter
 from slrharness.tmux_runner import (
     WorkerSpec,
     capture_pane,
@@ -68,10 +93,14 @@ from slrharness.topic_execution import (
     LEGACY_WORKER,
     TOPIC_COORDINATOR,
     TopicExecutionConfig,
+    build_stage_prompt,
     build_coordinator_prompt,
+    derive_topic_status,
     finish_topic_attempt,
     initialize_topic_attempt,
+    load_observations,
     record_topic_process,
+    task_id_for_topic_path,
     topic_paths,
     validate_coordinator_outputs,
 )
@@ -342,7 +371,9 @@ def build_manager_prompt(workspace: Path, round_num: int, phase: str) -> str:
         1. SCOPE_ORIGINAL.md is READ-ONLY. Never modify it.
         2. SCOPE.md is the canonical approved scope and is READ-ONLY. Record any
            proposed future scope change as a non-binding note; never edit it.
-        3. You OWN TASKS.md and SUMMARY.md. Workers never touch these.
+        3. The Harness owns TASKS.md and lifecycle state. You may propose tasks
+           during PLAN; the Harness imports them and immediately re-renders the
+           file. You own only research synthesis content in SUMMARY.md.
         4. You never search databases directly -- that is workers' job.
         5. SUMMARY.md must be organized per the ranking & grouping criteria in
            SCOPE.md. Items must appear in the order those criteria dictate.
@@ -357,8 +388,8 @@ def build_manager_prompt(workspace: Path, round_num: int, phase: str) -> str:
         - topics/ (READ ONLY). A TASKS entry `topics/x/y` has exactly one
           primary synthesis at `topics/x/y.md`. A same-stem directory
           `topics/x/y/` contains supporting paper notes, technical notes,
-          audits, task state, and a coordinator manifest; these are evidence
-          attachments, not additional topics.
+          but no authoritative task state; these are evidence attachments,
+          not additional topics.
     """)
 
     if phase == "plan":
@@ -400,8 +431,8 @@ def build_manager_prompt(workspace: Path, round_num: int, phase: str) -> str:
             2. For each TASKS topic, validate its primary `topics/.../*.md`
                synthesis. Do not count supporting notes below its same-stem
                directory as separate topics. You may consult
-               `coordinator_manifest.json`, `task.json`, paper notes, technical
-               notes, and metadata audit as supporting evidence. Validate:
+               paper notes, technical notes, the source registry, and the
+               program issue ledger as supporting evidence. Validate:
                - Required sections present (Summary, Key Findings,
                  Comparison Data, References, Sources, Related Topics)
                - Inclusion/exclusion criteria from SCOPE.md were applied
@@ -416,13 +447,12 @@ def build_manager_prompt(workspace: Path, round_num: int, phase: str) -> str:
                  defines an operational legacy ranking rubric
                - `## Related Topics` connects to at least one sibling topic when
                  such connections exist
-            3. In TASKS.md, mark successfully completed tasks with `[x]` and move
-               them to the "Completed" section with the round number.
-            4. Leave failed/incomplete tasks as `[ ]` with a note explaining why.
-            5. Update SUMMARY.md with validated findings. Re-sort the comparison
+            3. Do not change task IDs, checkboxes, stages, counts, or statuses;
+               the Harness derives and renders them from SLR_STATE.json.
+            4. Update SUMMARY.md with validated findings. Re-sort the comparison
                table and findings sections per the ranking & grouping criteria in
                SCOPE.md now that new items are in play.
-            6. Run:
+            5. Run:
                  git add -A
                  git commit -m "round-{round_num}-review: <brief summary>"
 
@@ -579,7 +609,10 @@ def run_manager(
         workspace / "SLR_STATE.json",
         workspace / "SCOPE.md",
         workspace / "SCOPE_ORIGINAL.md",
+        workspace / "artifacts" / "ISSUES.jsonl",
     ]
+    if phase == "review":
+        protected_paths.append(workspace / "TASKS.md")
     protected = {
         path: path.read_bytes() if path.is_file() else None for path in protected_paths
     }
@@ -631,8 +664,10 @@ def run_named_agent(
     """Run one named top-level agent with captured status and bounded waiting."""
     protected_paths = [
         workspace / "SLR_STATE.json",
+        workspace / "TASKS.md",
         workspace / "SCOPE.md",
         workspace / "SCOPE_ORIGINAL.md",
+        workspace / "artifacts" / "ISSUES.jsonl",
     ]
     protected = {
         path: path.read_bytes() if path.is_file() else None for path in protected_paths
@@ -809,7 +844,7 @@ def _read_topic_state(path: Path) -> dict[str, object] | None:
     return value if isinstance(value, dict) else None
 
 
-def run_topic_coordinators(
+def _run_legacy_topic_coordinators(
     workspace: Path,
     tasks: list[Task],
     round_num: int,
@@ -1152,6 +1187,395 @@ def _run_repair_tasks(
     return results
 
 
+def _run_program_stage_batch(
+    workspace: Path,
+    invocations: list[tuple[str, str, str, int]],
+    backend: AgentBackend,
+) -> dict[str, bool]:
+    """Run independent program-scheduled roles concurrently in tmux."""
+    if not invocations:
+        return {}
+    protected_paths = [
+        workspace / "SLR_STATE.json",
+        workspace / "TASKS.md",
+        workspace / "SCOPE.md",
+        workspace / "SCOPE_ORIGINAL.md",
+        workspace / "artifacts" / "ISSUES.jsonl",
+    ]
+    protected = {
+        path: path.read_bytes() if path.is_file() else None for path in protected_paths
+    }
+    specs: list[WorkerSpec] = []
+    for index, (invocation_id, role, prompt, _timeout) in enumerate(invocations, 1):
+        window = f"stage-{index}"
+        status_path = _agent_status_path(workspace, invocation_id)
+        specs.append(
+            WorkerSpec(
+                window_name=window,
+                command=backend.build_command(role, prompt, cwd=workspace),
+                done_channel=f"{invocation_id}-done",
+                cwd=workspace,
+                exit_status_path=status_path,
+            )
+        )
+    timeout = max(value[3] for value in invocations)
+    spawn_workers(COORDINATOR_SESSION, specs)
+    completed = wait_for_all(specs, timeout=timeout)
+    results: dict[str, bool] = {}
+    for spec, values in zip(specs, invocations, strict=True):
+        invocation_id, role, prompt, role_timeout = values
+        exit_code = _read_agent_exit_code(spec.exit_status_path)
+        output = capture_pane(COORDINATOR_SESSION, spec.window_name)
+        ok = completed[spec.window_name] and exit_code == 0
+        results[invocation_id] = ok
+        _write_agent_run_record(
+            workspace,
+            invocation_id,
+            role,
+            prompt,
+            role_timeout,
+            completed[spec.window_name],
+            exit_code,
+            output,
+        )
+    kill_session(COORDINATOR_SESSION)
+    _restore_protected_paths(protected)
+    return results
+
+
+def _record_stage_invocation(
+    workspace: Path,
+    task_id: str,
+    invocation_id: str,
+    role: str,
+    stage: str,
+    attempt: int,
+    staging: Path,
+    status: str,
+    diagnostic: str | None = None,
+) -> None:
+    prior = None
+    try:
+        prior = json.loads((workspace / "SLR_STATE.json").read_text(encoding="utf-8"))["control"]["invocations"].get(invocation_id)
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        pass
+    record_invocation(
+        workspace,
+        AgentInvocation(
+            invocation_id=invocation_id,
+            task_id=task_id,
+            role=role,
+            stage=stage,
+            attempt=attempt,
+            status=status,
+            staging_path=staging.resolve().relative_to(workspace.resolve()).as_posix(),
+            started_at=(prior or {}).get("started_at") or control_now(),
+            completed_at=control_now() if status in {"COMPLETE", "FAILED"} else None,
+            diagnostic=diagnostic,
+        ),
+    )
+
+
+def _run_program_topic(
+    workspace: Path,
+    task: Task,
+    round_num: int,
+    config: TopicExecutionConfig,
+    backend: AgentBackend,
+) -> bool:
+    paths = topic_paths(workspace, task.topic_path)
+    records = {item["task_id"]: item for item in state_topic_tasks(workspace)}
+    record = records[paths.task_id]
+    if record.get("status") in {"COMPLETE", "COMPLETE_WITH_WARNINGS"}:
+        return True
+    attempt = int(record.get("attempt", 0)) + 1
+    update_topic_task(
+        workspace, paths.task_id, attempt=attempt, status="RUNNING", stage="RESEARCH"
+    )
+
+    # The two retrieval roles are the only deliberately concurrent topic stages.
+    role_inputs: list[tuple[str, str, str, int]] = []
+    role_staging: dict[str, Path] = {}
+    import_diagnostics: list[str] = []
+    resume_stage = str(record.get("stage") or "PLANNED")
+    academic_done = paths.paper_dir.is_dir() and any(paths.paper_dir.glob("*.md"))
+    technical_done = paths.technical_dir.is_dir() and any(
+        paths.technical_dir.glob("*.md")
+    )
+    retrieval_roles = tuple(
+        item
+        for item in (
+            ("academic", config.academic_agent, config.academic_max_turns),
+            ("technical", config.technical_agent, config.technical_max_turns),
+        )
+        if not (academic_done if item[0] == "academic" else technical_done)
+    )
+    for label, role, _turns in retrieval_roles:
+        invocation_id = f"{paths.task_id}-{label}-{attempt}"
+        staging = staging_directory(workspace, invocation_id)
+        role_staging[label] = staging
+        prompt = build_stage_prompt(
+            workspace, paths, role, staging, task.description, config
+        )
+        _record_stage_invocation(
+            workspace, paths.task_id, invocation_id, role, "RESEARCH", attempt,
+            staging, "RUNNING"
+        )
+        role_inputs.append((invocation_id, role, prompt, config.coordinator_timeout_seconds))
+    stage_results = _run_program_stage_batch(workspace, role_inputs, backend)
+    for label, role, _turns in retrieval_roles:
+        invocation_id = f"{paths.task_id}-{label}-{attempt}"
+        imported = import_staged_notes(
+            workspace,
+            paths,
+            role_staging[label] / ("papers" if label == "academic" else "technical"),
+            kind="paper" if label == "academic" else "technical",
+            diagnostics=import_diagnostics,
+        ) if (role_staging[label] / ("papers" if label == "academic" else "technical")).is_dir() else []
+        ok = stage_results.get(invocation_id, False) or bool(imported)
+        _record_stage_invocation(
+            workspace, paths.task_id, invocation_id, role, "RESEARCH", attempt,
+            role_staging[label], "COMPLETE" if ok else "FAILED",
+            None if ok else "agent failed and produced no importable notes"
+        )
+    if retrieval_roles:
+        update_topic_task(
+            workspace,
+            paths.task_id,
+            stage="NOTES_NORMALIZED",
+            diagnostics=import_diagnostics,
+        )
+
+    invocation_records = json.loads(
+        (workspace / "SLR_STATE.json").read_text(encoding="utf-8")
+    ).get("control", {}).get("invocations", {})
+    metadata_done = any(
+        isinstance(value, dict)
+        and value.get("task_id") == paths.task_id
+        and value.get("role") == config.metadata_agent
+        and value.get("status") == "COMPLETE"
+        for value in invocation_records.values()
+    ) if isinstance(invocation_records, dict) else False
+    prefix = paths.paper_dir.resolve().relative_to(workspace.resolve()).as_posix()
+    topic_open_issues = [
+        issue for issue in current_issues(workspace).values()
+        if str(issue.get("target", "")).startswith(prefix)
+        and issue.get("status") != "verified_closed"
+    ]
+    if (
+        (not metadata_done or topic_open_issues)
+        and any(paths.paper_dir.glob("*.md"))
+        and not (paths.paper_dir / "NO_RESULTS.md").is_file()
+    ):
+        checker_id = f"{paths.task_id}-metadata-{attempt}"
+        checker_staging = staging_directory(workspace, checker_id)
+        checker_prompt = build_stage_prompt(
+            workspace, paths, config.metadata_agent, checker_staging,
+            task.description, config
+        )
+        _record_stage_invocation(
+            workspace, paths.task_id, checker_id, config.metadata_agent,
+            "METADATA_CHECK", attempt, checker_staging, "RUNNING"
+        )
+        checker_ok = _run_program_stage_batch(
+            workspace,
+            [(checker_id, config.metadata_agent, checker_prompt, config.coordinator_timeout_seconds)],
+            backend,
+        ).get(checker_id, False)
+        observations = load_observations(checker_staging / "metadata_observations.jsonl")
+        for observation in observations:
+            ingest_metadata_observation(workspace, observation, checker_id)
+            apply_verification_observation(workspace, observation)
+        _record_stage_invocation(
+            workspace, paths.task_id, checker_id, config.metadata_agent,
+            "METADATA_CHECK", attempt, checker_staging,
+            "COMPLETE" if checker_ok and observations else "FAILED",
+            None if observations else "checker produced no observations"
+        )
+
+        corrections_used = int(record.get("correction_rounds_used", 0))
+        for correction_round in range(
+            corrections_used + 1, config.max_correction_rounds + 1
+        ):
+            repair_issues = [
+                issue for issue in current_issues(workspace).values()
+                if str(issue.get("target", "")).startswith(prefix)
+                and issue.get("status") in {"open", "unresolved", "repair_dispatched"}
+            ]
+            applied_issues = [
+                issue for issue in current_issues(workspace).values()
+                if str(issue.get("target", "")).startswith(prefix)
+                and issue.get("status") == "applied"
+            ]
+            if not repair_issues and not applied_issues:
+                break
+            update_topic_task(
+                workspace,
+                paths.task_id,
+                correction_rounds_used=correction_round,
+            )
+            for issue in repair_issues:
+                if issue.get("status") != "repair_dispatched":
+                    transition_issue(
+                        workspace, str(issue["issue_id"]), "repair_dispatched"
+                    )
+                repair_id = f"{paths.task_id}-repair-{issue['issue_id']}-{correction_round}"
+                repair_staging = staging_directory(workspace, repair_id)
+                target = workspace / str(issue["target"])
+                before_meta, before_body = parse_frontmatter(target)
+                prompt = build_stage_prompt(
+                    workspace, paths, config.academic_agent, repair_staging,
+                    task.description, config, issue=issue
+                )
+                _record_stage_invocation(
+                    workspace, paths.task_id, repair_id, config.academic_agent,
+                    "METADATA_FINISHED", attempt, repair_staging, "RUNNING"
+                )
+                repair_ok = _run_program_stage_batch(
+                    workspace,
+                    [(repair_id, config.academic_agent, prompt, config.coordinator_timeout_seconds)],
+                    backend,
+                ).get(repair_id, False)
+                after_meta, after_body = parse_frontmatter(target)
+                changed_fields = {
+                    key for key in set(before_meta) | set(after_meta)
+                    if before_meta.get(key) != after_meta.get(key)
+                }
+                expected = {str(issue["field"])}
+                verified = (issue.get("evidence") or {}).get("verified")
+                actual = after_meta.get(str(issue["field"]))
+                field_name = str(issue["field"])
+                if field_name == "doi":
+                    value_matches = normalize_doi(actual) == normalize_doi(verified)
+                elif field_name == "arxiv_id":
+                    value_matches = normalize_arxiv(actual) == normalize_arxiv(verified)
+                else:
+                    value_matches = re.sub(r"\s+", " ", str(actual).strip()).casefold() == re.sub(
+                        r"\s+", " ", str(verified).strip()
+                    ).casefold()
+                if (
+                    repair_ok
+                    and changed_fields == expected
+                    and before_body == after_body
+                    and value_matches
+                ):
+                    transition_issue(
+                        workspace, str(issue["issue_id"]), "applied",
+                        applied_by_invocation=repair_id
+                    )
+                    repair_status = "COMPLETE"
+                else:
+                    transition_issue(
+                        workspace, str(issue["issue_id"]), "unresolved",
+                        diagnostic="repair did not change exactly the allowed field"
+                    )
+                    repair_status = "FAILED"
+                _record_stage_invocation(
+                    workspace, paths.task_id, repair_id, config.academic_agent,
+                    "METADATA_FINISHED", attempt, repair_staging, repair_status
+                )
+            recheck_id = f"{paths.task_id}-metadata-recheck-{attempt}-{correction_round}"
+            recheck_staging = staging_directory(workspace, recheck_id)
+            prompt = build_stage_prompt(
+                workspace, paths, config.metadata_agent, recheck_staging,
+                task.description, config
+            )
+            _record_stage_invocation(
+                workspace, paths.task_id, recheck_id, config.metadata_agent,
+                "METADATA_FINISHED", attempt, recheck_staging, "RUNNING"
+            )
+            recheck_ok = _run_program_stage_batch(
+                workspace,
+                [(recheck_id, config.metadata_agent, prompt, config.coordinator_timeout_seconds)],
+                backend,
+            )
+            recheck_observations = load_observations(
+                recheck_staging / "metadata_observations.jsonl"
+            )
+            for observation in recheck_observations:
+                apply_verification_observation(workspace, observation)
+            _record_stage_invocation(
+                workspace, paths.task_id, recheck_id, config.metadata_agent,
+                "METADATA_FINISHED", attempt, recheck_staging,
+                "COMPLETE" if recheck_ok and recheck_observations else "FAILED"
+            )
+    if resume_stage not in {"METADATA_FINISHED", "TERMINAL"}:
+        update_topic_task(workspace, paths.task_id, stage="METADATA_FINISHED")
+
+    synthesis_valid = paths.synthesis.is_file() and len(
+        paths.synthesis.read_text(encoding="utf-8").strip()
+    ) >= 200
+    synthesis_ok = synthesis_valid
+    if not synthesis_valid:
+        synthesis_id = f"{paths.task_id}-synthesis-{attempt}"
+        synthesis_staging = staging_directory(workspace, synthesis_id)
+        synthesis_prompt = build_stage_prompt(
+            workspace, paths, config.coordinator_agent, synthesis_staging,
+            task.description, config
+        )
+        update_topic_task(workspace, paths.task_id, stage="SYNTHESIS")
+        _record_stage_invocation(
+            workspace, paths.task_id, synthesis_id, config.coordinator_agent,
+            "SYNTHESIS", attempt, synthesis_staging, "RUNNING"
+        )
+        synthesis_ok = _run_program_stage_batch(
+            workspace,
+            [(synthesis_id, config.coordinator_agent, synthesis_prompt, config.coordinator_timeout_seconds)],
+            backend,
+        ).get(synthesis_id, False)
+        _record_stage_invocation(
+            workspace, paths.task_id, synthesis_id, config.coordinator_agent,
+            "SYNTHESIS", attempt, synthesis_staging,
+            "COMPLETE" if synthesis_ok else "FAILED"
+        )
+    status, diagnostics = derive_topic_status(workspace, paths)
+    diagnostics = [
+        *(str(value) for value in record.get("diagnostics", [])),
+        *import_diagnostics,
+        *diagnostics,
+    ]
+    if not synthesis_ok and status == "COMPLETE":
+        status = "COMPLETE_WITH_WARNINGS"
+        diagnostics.append("synthesizer process failed after producing valid synthesis")
+    update_topic_task(
+        workspace, paths.task_id, stage="TERMINAL", status=status,
+        diagnostics=diagnostics
+    )
+    return status in {"COMPLETE", "COMPLETE_WITH_WARNINGS"}
+
+
+def run_topic_coordinators(
+    workspace: Path,
+    tasks: list[Task],
+    round_num: int,
+    config: TopicExecutionConfig,
+    backend: AgentBackend,
+    batch_executor: CoordinatorBatchExecutor = _execute_coordinator_batch,
+) -> dict[str, bool]:
+    """Run program-owned stages; retain injected legacy executor for old tests/tools."""
+    if batch_executor is not _execute_coordinator_batch:
+        return _run_legacy_topic_coordinators(
+            workspace, tasks, round_num, config, backend, batch_executor
+        )
+    register_tasks(workspace, tasks, round_num)
+    return {
+        task.topic_path: _run_program_topic(
+            workspace, task, round_num, config, backend
+        )
+        for task in tasks
+    }
+
+
+def _load_prefinal_json(workspace: Path) -> dict[str, object] | None:
+    try:
+        value = json.loads(
+            (workspace / PREFINAL_AUDIT_PATH).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def run_finalization_pipeline(
     workspace: Path,
     round_num: int,
@@ -1167,6 +1591,15 @@ def run_finalization_pipeline(
     deploy_claude_assets(workspace, overwrite=False)
     prior = finalization_state(workspace)
     if prior.get("phase") == "COMPLETE":
+        prior_audit = _load_prefinal_json(workspace) or {}
+        if collect_blocking_gaps(prior_audit):
+            update_finalization_state(
+                workspace,
+                "AWAITING_INTERVENTION",
+                config,
+                failure=blocking_gap_summary(prior_audit),
+            )
+            return False
         validation = validate_final_report(workspace, config)
         if validation.accepted:
             print("Final report is already complete; resume skipped regeneration.")
@@ -1182,6 +1615,7 @@ def run_finalization_pipeline(
     _commit_finalization_artifacts(workspace, "finalization: aggregate sources")
 
     if config.enable_prefinal_audit:
+        deterministic_audit = audit
         semantic_ok = run_named_agent(
             workspace,
             config.finalizer_agent,
@@ -1190,21 +1624,28 @@ def run_finalization_pipeline(
             manager_timeout,
             backend,
         )
-        audit_ok, audit_errors = validate_prefinal_audit(workspace)
-        if not semantic_ok or not audit_ok:
+        semantic_audit = _load_prefinal_json(workspace)
+        if not semantic_ok or not isinstance(semantic_audit, dict):
             update_finalization_state(
                 workspace,
                 "AWAITING_INTERVENTION",
                 config,
-                failure="; ".join(audit_errors or ["pre-final audit agent failed"]),
+                failure="pre-final audit agent failed or wrote invalid JSON",
             )
             _commit_finalization_artifacts(
                 workspace, "finalization: record pre-final audit failure"
             )
             return False
-        audit = json.loads(
-            (workspace / PREFINAL_AUDIT_PATH).read_text(encoding="utf-8")
+        audit = merge_semantic_prefinal_audit(
+            workspace, deterministic_audit, semantic_audit
         )
+        audit_ok, audit_errors = validate_prefinal_audit(workspace)
+        if not audit_ok:
+            update_finalization_state(
+                workspace, "AWAITING_INTERVENTION", config,
+                failure="; ".join(audit_errors),
+            )
+            return False
         _commit_finalization_artifacts(workspace, "finalization: pre-final audit")
 
     final_state = finalization_state(workspace)
@@ -1298,7 +1739,19 @@ def run_finalization_pipeline(
             _commit_finalization_artifacts(
                 workspace, "finalization: rebuild sources after repair"
             )
+            if collect_blocking_gaps(audit) and audit.get("status") == "FAILED":
+                update_finalization_state(
+                    workspace,
+                    "AWAITING_INTERVENTION",
+                    config,
+                    failure=blocking_gap_summary(audit),
+                )
+                _commit_finalization_artifacts(
+                    workspace, "finalization: repair left blockers"
+                )
+                return False
             if config.enable_prefinal_audit:
+                deterministic_audit = audit
                 reaudit_agent_ok = run_named_agent(
                     workspace,
                     config.finalizer_agent,
@@ -1307,18 +1760,25 @@ def run_finalization_pipeline(
                     manager_timeout,
                     backend,
                 )
-                audit_ok, audit_errors = validate_prefinal_audit(workspace)
-                if reaudit_agent_ok and audit_ok:
-                    audit = json.loads(
-                        (workspace / PREFINAL_AUDIT_PATH).read_text(encoding="utf-8")
+                semantic_audit = _load_prefinal_json(workspace)
+                if reaudit_agent_ok and isinstance(semantic_audit, dict):
+                    audit = merge_semantic_prefinal_audit(
+                        workspace, deterministic_audit, semantic_audit
                     )
+                    audit_ok, audit_errors = validate_prefinal_audit(workspace)
+                    if not audit_ok:
+                        update_finalization_state(
+                            workspace, "AWAITING_INTERVENTION", config,
+                            failure="; ".join(audit_errors),
+                        )
+                        return False
                 else:
                     update_finalization_state(
                         workspace,
                         "AWAITING_INTERVENTION",
                         config,
                         failure="; ".join(
-                            audit_errors or ["pre-final re-audit agent failed"]
+                            ["pre-final re-audit agent failed or wrote invalid JSON"]
                         ),
                     )
                     _commit_finalization_artifacts(
@@ -1329,6 +1789,13 @@ def run_finalization_pipeline(
                     workspace, "finalization: pre-final audit after repair"
                 )
         else:
+            audit = {
+                **audit,
+                "status": "FAILED",
+                "repair_required": False,
+                "repair_unavailable": True,
+            }
+            atomic_write_json(workspace / PREFINAL_AUDIT_PATH, audit)
             update_finalization_state(
                 workspace,
                 "AWAITING_INTERVENTION",
@@ -1340,14 +1807,40 @@ def run_finalization_pipeline(
             )
             return False
 
-    if audit.get("status") == "FAILED" and not config.allow_finalize_with_limitations:
+    blockers = collect_blocking_gaps(audit)
+    ledger_blockers = blocking_issue_ids(workspace)
+    incomplete_tasks = [
+        str(item.get("task_id"))
+        for item in state_topic_tasks(workspace)
+        if item.get("status") not in {"COMPLETE", "COMPLETE_WITH_WARNINGS"}
+    ]
+    if blockers or ledger_blockers or incomplete_tasks:
+        failure = (
+            blocking_gap_summary(audit)
+            if blockers
+            else "open blocking issues: " + ", ".join(ledger_blockers)
+            if ledger_blockers
+            else "incomplete topic tasks: " + ", ".join(incomplete_tasks)
+        )
         update_finalization_state(
             workspace,
             "AWAITING_INTERVENTION",
             config,
-            failure="pre-final audit blocks finalization",
+            failure=failure,
         )
         _commit_finalization_artifacts(workspace, "finalization: blocked")
+        return False
+    if (
+        audit.get("status") == "PASS_WITH_LIMITATIONS"
+        and not config.allow_finalize_with_limitations
+    ):
+        update_finalization_state(
+            workspace,
+            "AWAITING_INTERVENTION",
+            config,
+            failure="pre-final limitations require intervention by configuration",
+        )
+        _commit_finalization_artifacts(workspace, "finalization: limitations blocked")
         return False
 
     update_finalization_state(
@@ -1359,7 +1852,10 @@ def run_finalization_pipeline(
             "technical_sources": len(registry.get("technical_sources", [])),
         },
     )
+    delivery = delivery_statistics(workspace, registry)
+    build_report_packet(workspace, delivery)
     diagnostics: list[str] = []
+    valid_sections: set[int] = set()
     for attempt in range(1, config.finalizer_retries + 2):
         report = workspace / config.canonical_report
         if report.is_file():
@@ -1373,19 +1869,40 @@ def run_finalization_pipeline(
             finalizer_attempt=attempt,
             validation_diagnostics=diagnostics,
         )
-        finalizer_ok = run_named_agent(
-            workspace,
-            config.finalizer_agent,
-            build_finalizer_prompt(workspace, config, diagnostics),
-            f"manager-finalize-{attempt}",
-            config.finalizer_timeout_seconds,
-            backend,
-        )
+        finalizer_ok = True
+        diagnostics = []
+        for section_number in range(1, 6):
+            if section_number in valid_sections:
+                continue
+            section_ok = run_named_agent(
+                workspace,
+                config.finalizer_agent,
+                build_section_prompt(workspace, section_number),
+                f"manager-section-{section_number}-attempt-{attempt}",
+                config.finalizer_timeout_seconds,
+                backend,
+            )
+            valid, section_errors = validate_section(workspace, section_number)
+            if section_ok and valid:
+                valid_sections.add(section_number)
+            else:
+                finalizer_ok = False
+                diagnostics.extend(
+                    f"section {section_number}: {error}" for error in section_errors
+                )
+        if len(valid_sections) == 5:
+            try:
+                assemble_report(workspace, config.canonical_report, delivery)
+            except ValueError as exc:
+                finalizer_ok = False
+                diagnostics.append(str(exc))
+        else:
+            finalizer_ok = False
         update_finalization_state(
             workspace, "FINAL_VALIDATION", config, finalizer_attempt=attempt
         )
         validation = validate_final_report(workspace, config)
-        diagnostics = [*validation.errors, *validation.warnings]
+        diagnostics = [*diagnostics, *validation.errors, *validation.warnings]
         if not finalizer_ok:
             diagnostics.insert(0, "finalizer process failed or timed out")
         if finalizer_ok and validation.accepted:
@@ -1395,6 +1912,11 @@ def run_finalization_pipeline(
                 config,
                 finalizer_attempt=attempt,
                 final_audit=FINAL_AUDIT_PATH,
+                completion_status=(
+                    "COMPLETE_WITH_WARNINGS"
+                    if validation.warnings
+                    else "COMPLETE"
+                ),
                 completed_at=validation.audit["generated_at"],
             )
             _commit_finalization_artifacts(
@@ -1462,6 +1984,7 @@ def _run_slr_unlocked(
 
     topic_config = topic_config or TopicExecutionConfig()
     finalization_config = finalization_config or FinalizationConfig()
+    migrate_legacy_tasks(workspace)
     last_round = current_round(workspace)
     start_round = last_round + 1
     end_round = start_round + max_rounds  # exclusive
@@ -1489,8 +2012,20 @@ def _run_slr_unlocked(
             )
             break
 
-        # Extract pending tasks after the plan pass
-        pending = parse_pending_tasks(tasks_md)
+        # The plan Markdown is a one-way agent proposal. Import it, then use
+        # structured state and re-render TASKS.md for every later decision.
+        proposed = parse_pending_tasks(tasks_md)
+        register_tasks(workspace, proposed, round_num, legacy_import=True)
+        pending = [
+            Task(
+                str(item["topic_path"]),
+                str(item.get("description", "")),
+                str(item.get("execution_mode") or TOPIC_COORDINATOR),
+                str(item.get("research_line_id") or "NOT_APPLICABLE"),
+                tuple(str(value) for value in item.get("diagnostics", [])),
+            )
+            for item in state_topic_tasks(workspace, status="PENDING")
+        ]
         if not pending:
             print(f"[round {round_num}] No pending tasks. Starting finalization.")
             finalized = run_finalization_pipeline(
@@ -1503,7 +2038,22 @@ def _run_slr_unlocked(
                 finalization_config,
             )
             if finalized:
+                update_round_status(workspace, round_num, "COMPLETE")
+                _git_commit_leftovers(
+                    workspace,
+                    round_num,
+                    "state",
+                    "record program-owned round completion",
+                )
                 tag_round(workspace, round_num)
+            else:
+                update_round_status(workspace, round_num, "AWAITING_INTERVENTION")
+                _git_commit_leftovers(
+                    workspace,
+                    round_num,
+                    "state",
+                    "record finalization intervention",
+                )
             break
 
         tasks_this_round = pending[:num_workers]
@@ -1523,9 +2073,17 @@ def _run_slr_unlocked(
         ]
         worker_results: dict[str, bool] = {}
         if legacy_tasks:
-            worker_results.update(
-                run_workers(workspace, legacy_tasks, round_num, worker_timeout, backend)
+            legacy_results = run_workers(
+                workspace, legacy_tasks, round_num, worker_timeout, backend
             )
+            worker_results.update(legacy_results)
+            for task in legacy_tasks:
+                update_topic_task(
+                    workspace,
+                    task_id_for_topic_path(task.topic_path),
+                    stage="TERMINAL",
+                    status="COMPLETE" if legacy_results.get(task.topic_path) else "FAILED",
+                )
         if coordinator_tasks:
             worker_results.update(
                 run_topic_coordinators(
@@ -1551,11 +2109,15 @@ def _run_slr_unlocked(
             )
             break
 
+        update_round_status(workspace, round_num, "COMPLETE")
+        _git_commit_leftovers(
+            workspace, round_num, "state", "record program-owned round completion"
+        )
         tag_round(workspace, round_num)
         print(f"[round {round_num}] Complete. Tagged round-{round_num}.")
         print()
 
-        if not parse_pending_tasks(tasks_md):
+        if not state_topic_tasks(workspace, status="PENDING"):
             print(f"[round {round_num}] Topic research complete. Finalizing...")
             run_finalization_pipeline(
                 workspace,

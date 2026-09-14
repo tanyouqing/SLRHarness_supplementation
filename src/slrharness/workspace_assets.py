@@ -20,6 +20,11 @@ CLAUDE_TEMPLATE_FILES = (
     "paper-note.md",
     "technical-note.md",
     "final-report.md",
+    "report-section-01.md",
+    "report-section-02.md",
+    "report-section-03.md",
+    "report-section-04.md",
+    "report-section-05.md",
 )
 
 

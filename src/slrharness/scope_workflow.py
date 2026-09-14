@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shutil
 import subprocess
@@ -20,17 +21,22 @@ from slrharness.agent_backends import (
 )
 from slrharness.contracts import (
     SCHEMA_VERSION,
+    ScopeContract,
     atomic_write_json,
     atomic_write_text,
     check_schema_version,
 )
-from slrharness.prioritization import write_scope_prioritization
+from slrharness.prioritization import (
+    compile_scope_prioritization,
+    write_scope_prioritization,
+)
 from slrharness.workspace_assets import deploy_claude_assets
 
 STATE_FILENAME = "SLR_STATE.json"
 PROPOSAL_FILENAME = "SCOPE_PROPOSAL.md"
 SOURCES_FILENAME = "SCOPE_SOURCES.md"
 REVISION_DIRNAME = "scope_revisions"
+SCOPE_CONTRACT_PATH = "artifacts/SCOPE_CONTRACT.json"
 
 SCOPE_NOT_STARTED = "SCOPE_NOT_STARTED"
 SCOPE_PREPARING = "SCOPE_PREPARING"
@@ -125,6 +131,85 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _markdown_section(text: str, heading: str) -> str:
+    match = re.search(
+        rf"^##\s+(?:[\d.)]+\s+)?{re.escape(heading)}(?:\s*\([^)]*\))?\s*$"
+        rf"\r?\n(.*?)(?=^##\s+|\Z)",
+        text,
+        re.MULTILINE | re.DOTALL | re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def _section_items(text: str, heading: str) -> tuple[str, ...]:
+    section = _markdown_section(text, heading)
+    items = [
+        re.sub(r"^\s*(?:[-*]|\d+[.)])\s+", "", line).strip()
+        for line in section.splitlines()
+        if re.match(r"^\s*(?:[-*]|\d+[.)])\s+", line)
+    ]
+    return tuple(item for item in items if item)
+
+
+def compile_scope_contract(scope_text: str) -> dict[str, object]:
+    """Compile the canonical machine contract from a validated proposal."""
+    prioritization = compile_scope_prioritization(
+        scope_text, source=PROPOSAL_FILENAME
+    )
+    terminology_section = _markdown_section(scope_text, "Terminology and Synonyms")
+    terminology = tuple(
+        {"text": line.strip(" -*|")}
+        for line in terminology_section.splitlines()
+        if line.strip() and not re.fullmatch(r"[|:\- ]+", line)
+    )
+    contract = ScopeContract(
+        research_questions=_section_items(scope_text, "Research Questions"),
+        terminology=terminology,
+        inclusion=_section_items(scope_text, "Inclusion Criteria"),
+        exclusion=_section_items(scope_text, "Exclusion Criteria"),
+        research_lines=tuple(prioritization.get("research_lines", [])),
+        comparison_dimensions=tuple(
+            str(value)
+            for value in prioritization.get("comparison_dimensions", [])
+        ),
+        ranking_mode=str(prioritization.get("ranking_mode", "qualitative_fallback")),
+        priority_factors=tuple(prioritization.get("factors", [])),
+        tiers=tuple(
+            dict.fromkeys(
+                str(item.get("priority_tier"))
+                for item in prioritization.get("research_lines", [])
+                if isinstance(item, dict) and item.get("priority_tier")
+            )
+        ),
+        ordering=tuple(
+            str(item.get("line_id"))
+            for item in prioritization.get("research_lines", [])
+            if isinstance(item, dict) and item.get("line_id")
+        ),
+        missing_data_policy=str(
+            prioritization.get("missing_data_policy", "unknown_not_zero")
+        ),
+        contradiction_policy="retain_and_surface",
+    ).to_dict()
+    contract.update(
+        {
+            "producer": "slrharness",
+            "source": PROPOSAL_FILENAME,
+            "compile_status": prioritization.get("compile_status", "PARTIAL"),
+            "compile_warnings": prioritization.get("warnings", []),
+            "content_markdown": scope_text,
+            "content_sha256": hashlib.sha256(scope_text.encode("utf-8")).hexdigest(),
+        }
+    )
+    return contract
+
+
+def write_scope_contract(workspace: Path, scope_text: str) -> dict[str, object]:
+    contract = compile_scope_contract(scope_text)
+    atomic_write_json(workspace / SCOPE_CONTRACT_PATH, contract)
+    return contract
+
+
 def require_scope_transition(current: object, target: str) -> None:
     if target == current:
         return
@@ -173,6 +258,14 @@ def _new_state(
         "formal_research_allowed": False,
         "config": asdict(config),
         "feedback_history": [],
+        "control": {
+            "schema_version": SCHEMA_VERSION,
+            "research_rounds": [],
+            "topic_tasks": {},
+            "invocations": {},
+            "open_blocking_issues": [],
+            "migration": {"legacy_loaded": False, "at": None},
+        },
         "history": [
             {
                 "at": utc_now(),
@@ -445,6 +538,19 @@ def _validate_scope_outputs_detailed(workspace: Path) -> tuple[list[str], list[s
             r"\bweight\b", policy, re.IGNORECASE
         ):
             warnings.append("weighted ranking has no parseable weight rubric")
+        # New proposals that explicitly opt into the modern policy contract
+        # must compile before approval. Legacy scopes without this section keep
+        # their qualitative fallback behavior.
+        if policy_match:
+            compiled = compile_scope_prioritization(text, PROPOSAL_FILENAME)
+            if compiled.get("compile_status") == "PARTIAL":
+                diagnostics = compiled.get("diagnostics") or compiled.get(
+                    "warnings", []
+                )
+                errors.append(
+                    "prioritization contract is PARTIAL: "
+                    + "; ".join(str(item) for item in diagnostics)
+                )
 
     if not sources.is_file():
         errors.append(f"missing {SOURCES_FILENAME}")
@@ -592,6 +698,11 @@ def run_scope_preparation(
         _commit_if_dirty(workspace, f"scope-{revision}: record invalid output")
         return False
 
+    # The proposal carries research judgment; the program freezes its schema.
+    write_scope_contract(
+        workspace, (workspace / PROPOSAL_FILENAME).read_text(encoding="utf-8")
+    )
+
     _archive_revision(workspace, revision)
     generated_at = utc_now()
     require_scope_transition(SCOPE_PREPARING, AWAITING_SCOPE_APPROVAL)
@@ -678,6 +789,8 @@ def approve_scope(workspace: Path, revision: int) -> bool:
         raise ValueError("Cannot approve invalid proposal: " + "; ".join(errors))
 
     proposal = (workspace / PROPOSAL_FILENAME).read_text(encoding="utf-8")
+    scope_contract = write_scope_contract(workspace, proposal)
+    proposal = str(scope_contract["content_markdown"])
     atomic_write_text(workspace / "SCOPE.md", proposal)
     atomic_write_text(workspace / "SCOPE_ORIGINAL.md", proposal)
     theme = str(state.get("theme", state["initial_topic"]))
@@ -688,6 +801,9 @@ def approve_scope(workspace: Path, revision: int) -> bool:
     (workspace / "topics" / ".gitkeep").touch()
     (workspace / "assets" / ".gitkeep").touch()
     write_scope_prioritization(workspace, proposal)
+    # The approved Markdown is rendered from the frozen contract, not trusted
+    # as an approval/status signal from the scope agent.
+    atomic_write_text(workspace / "artifacts/ISSUES.jsonl", "")
 
     approved_at = utc_now()
     history = list(state.get("history", []))

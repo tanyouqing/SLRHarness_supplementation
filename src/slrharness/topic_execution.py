@@ -11,16 +11,22 @@ from pathlib import Path
 from typing import Any
 
 from slrharness.contracts import SCHEMA_VERSION, check_schema_version
+from slrharness.control_plane import blocking_issue_ids, current_issues
 from slrharness.prioritization import (
     PAPER_ROLES,
     PRIORITIZATION_PATH,
     PRIORITY_TIERS,
     load_scope_prioritization,
 )
+from slrharness.source_registry import (
+    CORRECTABLE_FRONTMATTER_FIELDS,
+    parse_frontmatter,
+)
 
 LEGACY_WORKER = "legacy_worker"
 TOPIC_COORDINATOR = "topic_coordinator"
 TOPIC_EXECUTION_MODES = (LEGACY_WORKER, TOPIC_COORDINATOR)
+GENERATED_NOTE_NAMES = {"index.md", "no_results.md", "metadata_check.md"}
 
 
 @dataclass(frozen=True)
@@ -197,6 +203,7 @@ def initialize_topic_attempt(
     workspace = paths.artifact_root.parents[
         len(Path(paths.topic_path).parts) - 1
     ]
+    previous_contract = _load_json(paths.task_contract, "task contract", []) or {}
     for directory in (paths.paper_dir, paths.technical_dir, paths.audit_dir):
         directory.mkdir(parents=True, exist_ok=True)
     for durable_log in (
@@ -205,6 +212,32 @@ def initialize_topic_attempt(
         paths.correction_requests,
     ):
         durable_log.touch(exist_ok=True)
+    current_history = {
+        _workspace_relative(workspace, path): {
+            "size": len(path.read_bytes()),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in (paths.metadata_findings, paths.correction_requests)
+    }
+    previous_history = previous_contract.get("jsonl_history")
+    jsonl_history = current_history
+    if isinstance(previous_history, dict):
+        history_valid = True
+        for relative, expected in previous_history.items():
+            if not isinstance(expected, dict):
+                continue
+            path = workspace / relative
+            current = path.read_bytes() if path.is_file() else b""
+            size = int(expected.get("size", 0))
+            if len(current) < size or hashlib.sha256(current[:size]).hexdigest() != str(
+                expected.get("sha256")
+            ):
+                history_valid = False
+                break
+        if not history_valid:
+            # Preserve the last trusted baseline so a retry cannot legitimize
+            # an earlier overwrite merely by starting a new attempt.
+            jsonl_history = previous_history
     task_contract = {
         "schema_version": SCHEMA_VERSION,
         "producer": "slrharness",
@@ -227,6 +260,7 @@ def initialize_topic_attempt(
             ),
             "synthesis": _workspace_relative(workspace, paths.synthesis),
         },
+        "jsonl_history": jsonl_history,
     }
     _atomic_write_json(paths.task_contract, task_contract)
     state = {
@@ -245,6 +279,7 @@ def initialize_topic_attempt(
         "diagnostics": list(previous_diagnostics or []),
         "research_line_id": research_line_id,
         "prioritization_warnings": list(prioritization_warnings or []),
+        "jsonl_history": jsonl_history,
         "process": {
             "kind": "tmux",
             "session": None,
@@ -388,7 +423,9 @@ OUTER/INNER BOUNDARY:
   mode. The checker writes `audits/correction_requests.jsonl`; you then invoke
   `{config.academic_agent}` again with only the pending corrections, and invoke
   the checker again. Stop after {config.max_correction_rounds} correction
-  rounds. Record every handoff in `coordination_log.jsonl`.
+  rounds. Requests are append-only `pending → applied → resolved` (or
+  `unresolved`); pending and applied are both open. Never overwrite existing
+  JSONL history. Record every handoff in `coordination_log.jsonl`.
 - Maximum-turn budgets: coordinator {config.coordinator_max_turns}, academic
   {config.academic_max_turns}, technical {config.technical_max_turns}, metadata
   checker {config.metadata_max_turns}. Never wait or revise indefinitely.
@@ -417,7 +454,10 @@ METADATA CHECK CONTRACT:
 - Do not check methods, experiments, result numbers, conclusions, or analysis.
 - Append one finding per paper to `audits/metadata_findings.jsonl`. Valid item
   statuses: PASS, CORRECTED, UNRESOLVED, NOT_CHECKED. The Harness calculates
-  the audit summary, counts, and overall status.
+  the audit summary, counts, and overall status. A first mismatch is UNRESOLVED
+  plus a pending request. CORRECTED is valid only after the worker appends
+  applied, the checker re-verifies it, appends resolved, and records the exact
+  changed frontmatter fields in `corrected_frontmatter`.
 
 REQUIRED FINAL OUTPUTS:
 - Existing-compatible synthesis: `{paths.synthesis}`.
@@ -464,6 +504,137 @@ searches. Launch only roles needed for `missing_steps`, collect every background
 Agent handle before finishing, and complete only missing work. Do not generate
 the global Summary or final review.
 """
+
+
+def build_stage_prompt(
+    workspace: Path,
+    paths: TopicPaths,
+    role: str,
+    staging: Path,
+    description: str,
+    config: TopicExecutionConfig,
+    *,
+    issue: dict[str, Any] | None = None,
+) -> str:
+    """Build a narrow content-only contract for one program-scheduled stage."""
+    common = f"""PROGRAM-SCHEDULED TOPIC STAGE
+WORKSPACE: {workspace}
+TASK: {description}
+APPROVED SCOPE CONTRACT: {workspace / 'artifacts/SCOPE_CONTRACT.json'}
+RESEARCH-LINE CONTRACT: {workspace / PRIORITIZATION_PATH}
+TOPIC SYNTHESIS: {paths.synthesis}
+PAPER NOTES: {paths.paper_dir}
+TECHNICAL NOTES: {paths.technical_dir}
+INVOCATION STAGING: {staging}
+
+The program owns task IDs, attempts, rounds, stages, status, timestamps, counts,
+canonical IDs, canonical paths, issues, manifests, checkpoints, and finalization.
+Ignore any such values found in model-authored content. Do not edit TASKS.md,
+SLR_STATE.json, artifacts/ISSUES.jsonl, scope files, generated registries, or Git.
+"""
+    if issue is not None:
+        return common + f"""
+Apply exactly this program-dispatched metadata repair to the exact note:
+{json.dumps(issue, ensure_ascii=False, indent=2)}
+Modify only the named frontmatter field. Do not change body text or any other
+frontmatter field and do not declare the issue resolved.
+"""
+    if role == config.academic_agent:
+        return common + f"""
+Search and read academic papers for this topic. Write only research-content
+paper Markdown (or NO_RESULTS.md) below {staging / 'papers'}. Filenames are
+temporary; the program imports and names canonical notes. Follow the configured
+MCP fallback and citation-chaining policy. Do not write control fields.
+"""
+    if role == config.technical_agent:
+        return common + f"""
+Search and read technical sources for this topic. Write only research-content
+technical Markdown (or NO_RESULTS.md) below {staging / 'technical'}. Filenames
+are temporary; the program imports them. Keep non-peer-reviewed evidence clear.
+"""
+    if role == config.metadata_agent:
+        return common + f"""
+Independently inspect identity metadata in existing paper notes. Do not edit a
+note and do not declare issue status. Write one JSON object per line to
+{staging / 'metadata_observations.jsonl'} with note_path, checked_fields, and
+remaining_uncertainties. Each checked field contains observed, verified,
+source, and boolean match. No comments, arrays, counts, or lifecycle fields.
+"""
+    if role == config.coordinator_agent:
+        return common + f"""
+Act only as a topic content synthesizer. Read validated notes and write
+{paths.synthesis}. Include strongest support, strongest contradiction, missing
+evidence, topic-specific limitations, and the Scope-Driven Research-Line
+Assessment. Do not launch agents or create any control/audit file.
+"""
+    raise ValueError(f"unsupported topic stage role: {role}")
+
+
+def load_observations(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    observations: list[dict[str, Any]] = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        value = json.loads(line)
+        if not isinstance(value, dict):
+            raise ValueError(f"metadata observation line {number} is not an object")
+        observations.append(value)
+    return observations
+
+
+def derive_topic_status(workspace: Path, paths: TopicPaths) -> tuple[str, list[str]]:
+    """Derive topic terminal status solely from artifact predicates."""
+    diagnostics: list[str] = []
+    papers = [
+        path
+        for path in paths.paper_dir.glob("*.md")
+        if path.name.lower() not in GENERATED_NOTE_NAMES
+    ] if paths.paper_dir.is_dir() else []
+    technical = [
+        path
+        for path in paths.technical_dir.glob("*.md")
+        if path.name.lower() not in GENERATED_NOTE_NAMES
+    ] if paths.technical_dir.is_dir() else []
+    if not papers and not (paths.paper_dir / "NO_RESULTS.md").is_file():
+        diagnostics.append("required paper notes or NO_RESULTS.md are missing")
+    if not technical and not (paths.technical_dir / "NO_RESULTS.md").is_file():
+        diagnostics.append("required technical notes or NO_RESULTS.md are missing")
+    for note in papers:
+        try:
+            metadata, body = parse_frontmatter(note)
+        except OSError as exc:
+            diagnostics.append(f"cannot read paper note {note.name}: {exc}")
+            continue
+        identifiable = bool(metadata.get("title")) and bool(
+            metadata.get("authors") or metadata.get("doi") or metadata.get("arxiv_id")
+        )
+        if not identifiable or not body.strip():
+            diagnostics.append(f"paper note schema failed: {note.name}")
+    if not paths.synthesis.is_file() or len(
+        paths.synthesis.read_text(encoding="utf-8").strip()
+    ) < 200:
+        diagnostics.append("topic synthesis is missing or too short")
+    blockers = blocking_issue_ids(
+        workspace,
+        target_prefix=paths.paper_dir.resolve().relative_to(workspace.resolve()).as_posix(),
+    )
+    if blockers:
+        diagnostics.append("open topic blockers: " + ", ".join(blockers))
+        return "AWAITING_INTERVENTION", diagnostics
+    if diagnostics:
+        return "FAILED", diagnostics
+    warnings = [
+        identifier
+        for identifier, issue in current_issues(workspace).items()
+        if issue.get("severity") != "blocking"
+        and str(issue.get("target", "")).startswith(
+            paths.paper_dir.resolve().relative_to(workspace.resolve()).as_posix()
+        )
+        and issue.get("status") != "verified_closed"
+    ]
+    return ("COMPLETE_WITH_WARNINGS" if warnings else "COMPLETE"), diagnostics
 
 
 def _workspace_relative(workspace: Path, path: Path) -> str:
@@ -655,26 +826,37 @@ def validate_coordinator_outputs(
                 continue
             request_id = str(request.get("request_id") or "")
             request_status = str(request.get("status") or "").lower()
+            if request_status == "verified":
+                request_status = "resolved"
             if not request_id or request_status not in {
                 "pending",
+                "applied",
                 "resolved",
                 "unresolved",
             }:
                 errors.append(f"invalid correction request on line {line_number}")
                 continue
+            field_name = str(request.get("field") or "")
+            if field_name and field_name not in CORRECTABLE_FRONTMATTER_FIELDS:
+                warnings.append(
+                    f"ignored non-frontmatter correction field {field_name!r} "
+                    f"on line {line_number}"
+                )
+                continue
+            request = {**request, "status": request_status}
             signature = (
                 request_id,
                 str(request.get("note_path") or ""),
                 str(request.get("field") or ""),
             )
-            if request_status == "pending" and signature in seen_pending:
+            if request_status in {"pending", "applied"} and signature in seen_pending:
                 warnings.append(f"duplicate pending correction request: {request_id}")
             seen_pending.add(signature)
             latest_requests[request_id] = request
         pending_requests = [
             request_id
             for request_id, request in latest_requests.items()
-            if str(request.get("status")).lower() == "pending"
+            if str(request.get("status")).lower() in {"pending", "applied"}
         ]
         if pending_requests:
             message = f"unresolved correction requests: {sorted(pending_requests)}"

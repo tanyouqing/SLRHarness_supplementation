@@ -116,10 +116,10 @@ def _table(section: str) -> list[dict[str, str]]:
     ]
     if len(rows) < 2:
         return []
-    headers = [cell.strip() for cell in rows[0].strip("|").split("|")]
+    headers = [_clean_markdown(cell) for cell in rows[0].strip("|").split("|")]
     output: list[dict[str, str]] = []
     for row in rows[1:]:
-        cells = [cell.strip() for cell in row.strip("|").split("|")]
+        cells = [_clean_markdown(cell) for cell in row.strip("|").split("|")]
         if cells and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
             continue
         if len(cells) != len(headers):
@@ -129,15 +129,76 @@ def _table(section: str) -> list[dict[str, str]]:
 
 
 def _column(row: dict[str, str], *names: str) -> str:
-    normalized = {
-        re.sub(r"[^a-z0-9]", "", key.lower()): value
-        for key, value in row.items()
-    }
-    for name in names:
-        value = normalized.get(re.sub(r"[^a-z0-9]", "", name.lower()))
+    normalized = {_label(key): value for key, value in row.items()}
+    wanted_labels = [_label(name) for name in names]
+    for wanted in wanted_labels:
+        if wanted in normalized:
+            return _clean_markdown(normalized[wanted])
+    for wanted in wanted_labels:
+        value = next(
+            (
+                candidate
+                for key, candidate in normalized.items()
+                if key.startswith(wanted + " ")
+                and not (key.endswith(" id") and not wanted.endswith(" id"))
+            ),
+            None,
+        )
         if value is not None:
-            # Markdown tables often wrap IDs in backticks.
-            return value.strip().strip("`").strip()
+            return _clean_markdown(value)
+    return ""
+
+
+def _clean_markdown(value: Any) -> str:
+    text = re.sub(r"[`*]+", "", str(value or ""))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _label(value: Any) -> str:
+    text = _clean_markdown(value).lower()
+    text = re.sub(r"\s*\([^)]*\)\s*$", "", text)
+    text = text.replace("one-line", "").replace("one line", "")
+    text = text.replace("expected tier", "priority tier")
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def _contract_table(policy: str) -> dict[str, str]:
+    section = _subsection_with_heading_label(
+        policy, "Prioritization Policy at a Glance"
+    )
+    rows = _table(section)
+    return {
+        _label(_column(row, "Contract element", "Element")): _column(
+            row, "Proposed value", "Value"
+        )
+        for row in rows
+        if _column(row, "Contract element", "Element")
+    }
+
+
+def _contract_value(contract: dict[str, str], label: str) -> str:
+    wanted = _label(label)
+    return next(
+        (
+            value
+            for key, value in contract.items()
+            if key == wanted or key.startswith(wanted)
+        ),
+        "",
+    )
+
+
+def _ranking_mode(value: str) -> str:
+    normalized = _label(value).replace(" ", "_")
+    for token, canonical in (
+        ("ordinal_tiers", "ordinal"),
+        ("ordinal", "ordinal"),
+        ("numeric_dimension", "numeric_dimension"),
+        ("weighted_composite", "weighted_composite"),
+        ("qualitative_fallback", "qualitative_fallback"),
+    ):
+        if normalized.startswith(token):
+            return canonical
     return ""
 
 
@@ -167,13 +228,23 @@ def compile_scope_prioritization(
             "using qualitative fallback"
         )
         policy = legacy
-    ranking_unit = _first_value(_subsection(policy, "Ranking Unit")) or "research_line"
-    primary_grouping = _first_value(_subsection(policy, "Primary Grouping"))
+    contract_table = _contract_table(policy)
+    ranking_unit = _contract_value(contract_table, "Ranking Unit") or _first_value(
+        _subsection(policy, "Ranking Unit")
+    )
+    ranking_unit = (
+        "research_line" if "research line" in _label(ranking_unit) else ranking_unit
+    )
+    primary_grouping = _contract_value(
+        contract_table, "Primary Grouping"
+    ) or _first_value(_subsection(policy, "Primary Grouping"))
     if not primary_grouping and legacy:
         primary_grouping = "Use the approved legacy Ranking & Grouping Criteria."
         warnings.append("legacy grouping was interpreted at research-line/topic level")
-    ranking_mode = _first_value(_subsection(policy, "Ranking Mode")).lower()
-    ranking_mode = ranking_mode.split()[0] if ranking_mode else ""
+    ranking_mode = _ranking_mode(
+        _contract_value(contract_table, "Ranking Mode")
+        or _first_value(_subsection(policy, "Ranking Mode"))
+    )
     if ranking_mode not in VALID_RANKING_MODES:
         ranking_mode = "qualitative_fallback"
         warnings.append(
@@ -197,6 +268,7 @@ def compile_scope_prioritization(
             break
     research_lines: list[dict[str, Any]] = []
     seen: set[str] = set()
+    duplicate_line_ids = False
     for row in line_rows:
         name = _column(row, "Research Line", "Line", "Name", "Method Family")
         raw_id = _column(row, "Research Line ID", "Line ID")
@@ -212,6 +284,7 @@ def compile_scope_prioritization(
             line_warnings.append("stable fallback ID generated from research-line name")
             warnings.append(f"{name or line_id}: missing or invalid Research Line ID")
         if line_id in seen:
+            duplicate_line_ids = True
             warnings.append(f"duplicate Research Line ID ignored: {line_id}")
             continue
         seen.add(line_id)
@@ -248,13 +321,16 @@ def compile_scope_prioritization(
             )
 
     factors = []
-    for row in _table(_subsection(policy, "Priority Factors")):
+    factor_section = _subsection(policy, "Priority Factors") or (
+        _subsection_with_heading_label(policy, "Priority Factors")
+    )
+    for row in _table(factor_section):
         name = _column(row, "Factor", "Name")
         if not name:
             continue
         factor: dict[str, Any] = {
             "factor_id": (
-                _column(row, "Factor ID")
+                _column(row, "Factor ID", "ID")
                 or stable_research_line_id(name).replace("RL-", "F-", 1)
             ).upper(),
             "name": name,
@@ -300,9 +376,12 @@ def compile_scope_prioritization(
                 "weighted_composite factors require ranges and scoring rubrics"
             )
 
+    tier_text = _contract_value(contract_table, "Priority Tiers") or _subsection(
+        policy, "Primary Ordering"
+    ) or _subsection_with_heading_label(policy, "Priority Tiers")
     primary_ordering = re.findall(
         r"Core|Supporting|Peripheral|Insufficient Evidence",
-        _subsection(policy, "Primary Ordering"),
+        tier_text,
         re.IGNORECASE,
     )
     canonical_tiers = {tier.lower(): tier for tier in PRIORITY_TIERS}
@@ -310,27 +389,43 @@ def compile_scope_prioritization(
     if not primary_ordering:
         primary_ordering = list(PRIORITY_TIERS)
 
-    missing_policy_text = _subsection(policy, "Missing-Data Policy")
+    missing_policy_text = _contract_value(
+        contract_table, "Missing-Data Policy"
+    ) or _subsection(policy, "Missing-Data Policy")
     missing_policy = "unknown_not_zero"
     if not missing_policy_text:
         warnings.append("missing-data policy was defaulted to unknown_not_zero")
 
-    status = (
-        "COMPLETE"
-        if policy and ranking_mode != "qualitative_fallback"
-        else "PARTIAL"
-    )
+    completeness = {
+        "ranking unit is not research_line": ranking_unit != "research_line",
+        "ranking mode is missing or invalid": ranking_mode not in VALID_RANKING_MODES
+        or ranking_mode == "qualitative_fallback",
+        "research-line table is empty": not research_lines,
+        "research-line IDs are not unique": duplicate_line_ids,
+        "one or more research lines lack group information": any(
+            not line["group"] for line in research_lines
+        ),
+        "one or more research lines lack definitions": any(
+            not line["definition"] for line in research_lines
+        ),
+        "priority factors are missing": not factors,
+        "one or more priority factors lack a rubric": any(
+            not factor["rubric"] for factor in factors
+        ),
+        "priority tier ordering is incomplete": primary_ordering
+        != list(PRIORITY_TIERS),
+        "missing-data policy is absent": not missing_policy_text,
+    }
+    diagnostics = [message for message, failed in completeness.items() if failed]
+    warnings.extend(message for message in diagnostics if message not in warnings)
+    status = "COMPLETE" if policy and not diagnostics else "PARTIAL"
     if ranking_mode == "weighted_composite" and any(
         "weighted_composite" in warning for warning in warnings
     ):
         status = "PARTIAL"
     return {
         "prioritization_schema_version": PRIORITIZATION_SCHEMA_VERSION,
-        "ranking_unit": (
-            "research_line"
-            if ranking_unit.lower().replace("-", "_") == "research_line"
-            else ranking_unit
-        ),
+        "ranking_unit": ranking_unit,
         "ranking_mode": ranking_mode,
         "numeric_dimension": _first_value(
             _subsection(policy, "Numeric Dimension")
@@ -341,7 +436,9 @@ def compile_scope_prioritization(
         ).lower(),
         "primary_grouping": primary_grouping,
         "primary_ordering": primary_ordering,
-        "secondary_ordering": _first_value(_subsection(policy, "Secondary Ordering")),
+        "secondary_ordering": _contract_value(
+            contract_table, "Secondary Ordering"
+        ) or _first_value(_subsection(policy, "Secondary Ordering")),
         "missing_data_policy": missing_policy,
         "missing_data_policy_text": missing_policy_text,
         "contradictory_evidence_policy": "always_surface",
@@ -351,6 +448,7 @@ def compile_scope_prioritization(
         "paper_roles": list(PAPER_ROLES),
         "compile_status": status,
         "warnings": warnings,
+        "diagnostics": diagnostics,
         "source": source,
     }
 

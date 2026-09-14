@@ -1,6 +1,5 @@
 ---
 artifact_type: academic_paper_note
-paper_id: "P-<stable-doi-arxiv-or-title-key>"
 title: "<paper title>"
 authors: "<authors or Unavailable>"
 year: "<year or [UNVERIFIED]>"
@@ -12,9 +11,7 @@ version: "<preprint/conference/journal version or Not reported>"
 version_group: "<stable group or Not applicable>"
 access: full_text
 reading_status: depth_read
-metadata_status: PASS
 discovery_route: keyword_search
-note_status: complete
 research_line_ids: ["RL-..."]
 primary_evidence_role: "unassigned"
 ---

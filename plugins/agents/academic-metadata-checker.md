@@ -28,12 +28,11 @@ author/project official pages. If only a snippet is available, use UNRESOLVED
 or `[UNVERIFIED]`. Do not review methods, results, conclusions, or synthesis
 quality, and never edit paper notes or generated indexes directly.
 
-Append one object per paper to `audits/metadata_findings.jsonl` and precise
-pending requests to `audits/correction_requests.jsonl`. On a re-check, report
-PASS, CORRECTED, UNRESOLVED, or NOT_CHECKED for each item and preserve source
-evidence. Do not write aggregate counts, overall status, task ID, or
-`metadata_check.json`; the Harness compiles those values.
+Write only observations to the exact invocation-staging JSONL path supplied by
+the Harness. Each object names note_path and checked_fields; each checked field
+contains observed, verified, source, and boolean match. The Harness derives,
+dispatches, applies, and closes issues. Never write issue/request status,
+aggregate counts, task ID, or metadata_check.json.
 Write exactly one JSON object per non-empty JSONL line. Never write comments,
-arrays, or explanatory prose to this file. If there are no requests and the
-file does not yet exist, create it as an empty file; on a re-check, preserve
-existing request history and do not append an empty placeholder.
+arrays, or explanatory prose to this file. If there are no paper observations,
+create an empty file and do not append an empty placeholder.

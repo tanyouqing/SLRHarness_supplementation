@@ -11,10 +11,13 @@ import pytest
 
 from slrharness.finalization import (
     FINAL_AUDIT_PATH,
+    PREFINAL_AUDIT_PATH,
     FinalizationConfig,
     build_finalizer_prompt,
+    collect_blocking_gaps,
     delivery_statistics,
     ensure_stable_repair_tasks,
+    merge_semantic_prefinal_audit,
     run_structural_prefinal_audit,
     validate_final_report,
 )
@@ -29,6 +32,8 @@ from slrharness.source_registry import (
     REGISTRY_PATH,
     _deduplicate_papers,
     aggregate_sources,
+    normalize_arxiv,
+    normalize_doi,
     stable_paper_id,
     validate_paper_note,
 )
@@ -444,16 +449,16 @@ def test_unresolved_metadata_is_collected(tmp_path: Path) -> None:
 
 
 def test_arxiv_dedup_and_distinct_dois(tmp_path: Path) -> None:
-    assert stable_paper_id({"arxiv_id": "2401.1v2"}) == stable_paper_id(
-        {"arxiv_id": "2401.1"}
+    assert stable_paper_id({"arxiv_id": "2401.00001v2"}) == stable_paper_id(
+        {"arxiv_id": "2401.00001"}
     )
-    assert stable_paper_id({"doi": "10.1/a", "title": "Same"}) != stable_paper_id(
-        {"doi": "10.1/b", "title": "Same"}
+    assert stable_paper_id({"doi": "10.1234/a", "title": "Same"}) != stable_paper_id(
+        {"doi": "10.1234/b", "title": "Same"}
     )
     distinct, _ = _deduplicate_papers(
         [
-            {"doi": "10.1/a", "title": "Same", "note_path": "a.md"},
-            {"doi": "10.1/b", "title": "Same", "note_path": "b.md"},
+            {"doi": "10.1234/a", "title": "Same", "note_path": "a.md"},
+            {"doi": "10.1234/b", "title": "Same", "note_path": "b.md"},
         ],
         {},
     )
@@ -461,13 +466,13 @@ def test_arxiv_dedup_and_distinct_dois(tmp_path: Path) -> None:
     versions, _ = _deduplicate_papers(
         [
             {
-                "doi": "10.1/a",
+                "doi": "10.1234/a",
                 "title": "Preprint",
                 "version_group": "work-1",
                 "note_path": "a.md",
             },
             {
-                "doi": "10.1/b",
+                "doi": "10.1234/b",
                 "title": "Conference",
                 "version_group": "work-1",
                 "note_path": "b.md",
@@ -475,7 +480,59 @@ def test_arxiv_dedup_and_distinct_dois(tmp_path: Path) -> None:
         ],
         {},
     )
-    assert len(versions) == 1
+    assert len(versions) == 2
+
+
+def test_strong_identifier_first_dedup_and_old_registry_split() -> None:
+    assert normalize_doi("not reported (no DOI identified from search)") == ""
+    assert normalize_arxiv("[UNVERIFIED from search]") == ""
+    raw = [
+        {
+            "title": title,
+            "authors": ["Smith"],
+            "arxiv_id": arxiv,
+            "doi": "not reported (provider unavailable)",
+            "version_group": "shared free text",
+            "note_path": f"{arxiv}.md",
+            "topic_path": "topics/a.md",
+            "validation_status": "PASS",
+        }
+        for title, arxiv in (
+            ("ADAS", "2408.08435"),
+            ("Godel Agent", "2410.04444"),
+            ("SICA", "2504.15228"),
+            ("Darwin Godel Machine", "2505.22954"),
+            ("Huxley Godel Machine", "2510.21614"),
+        )
+    ]
+    previous = [{
+        "source_id": "POLDMERGED",
+        "arxiv_id": "2408.08435",
+        "note_paths": [item["note_path"] for item in raw],
+    }]
+    split, audit = _deduplicate_papers(raw, previous)
+    assert len(split) == len({item["source_id"] for item in split}) == 5
+    assert sum(item["source_id"] == "POLDMERGED" for item in split) == 1
+    assert any(item.get("migration_warning") for item in audit)
+    rerun, _ = _deduplicate_papers(raw, split)
+    assert [item["source_id"] for item in split] == [
+        item["source_id"] for item in rerun
+    ]
+
+    same, decisions = _deduplicate_papers(
+        [
+            {**raw[3], "note_path": "explicit.md"},
+            {
+                **raw[3],
+                "arxiv_id": "",
+                "doi": "https://doi.org/10.48550/arXiv.2505.22954",
+                "note_path": "datacite.md",
+            },
+        ],
+        [],
+    )
+    assert len(same) == 1
+    assert any(item.get("merge_reason") == "strong_match" for item in decisions)
 
 
 def test_corrected_metadata_must_match_note(tmp_path: Path) -> None:
@@ -483,14 +540,14 @@ def test_corrected_metadata_must_match_note(tmp_path: Path) -> None:
     _note(note, metadata_status="CORRECTED")
     audit_item = {
         "status": "CORRECTED",
-        "checked_fields": {"title": {"verified": "A Different Corrected Title"}},
+        "corrected_frontmatter": {"title": "A Different Corrected Title"},
     }
     result = validate_paper_note(tmp_path, note, audit_item=audit_item)
     assert not result.valid
     assert any("corrected metadata" in error for error in result.errors)
 
 
-def test_corrected_metadata_field_list_is_a_warning(tmp_path: Path) -> None:
+def test_non_frontmatter_checked_fields_are_not_compared(tmp_path: Path) -> None:
     note = tmp_path / "note.md"
     _note(note, metadata_status="CORRECTED")
     result = validate_paper_note(
@@ -498,11 +555,10 @@ def test_corrected_metadata_field_list_is_a_warning(tmp_path: Path) -> None:
         note,
         audit_item={
             "status": "CORRECTED",
-            "checked_fields": ["title"],
+            "checked_fields": {"note_to_paper_identity": {"verified": "different"}},
         },
     )
     assert result.valid
-    assert any("lists names only" in warning for warning in result.warnings)
 
 
 def test_prefinal_pass_and_missing_synthesis_stable_gap(tmp_path: Path) -> None:
@@ -524,7 +580,34 @@ def test_prefinal_pass_and_missing_synthesis_stable_gap(tmp_path: Path) -> None:
         == failed2["structural_issues"][0]["gap_id"]
     )
     limited = run_structural_prefinal_audit(workspace, config, repair_rounds_used=1)
-    assert limited["status"] == "PASS_WITH_LIMITATIONS"
+    assert limited["status"] == "FAILED"
+    assert collect_blocking_gaps(limited)
+
+
+def test_semantic_audit_cannot_downgrade_deterministic_blocker(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    aggregate_sources(workspace)
+    deterministic = run_structural_prefinal_audit(
+        workspace, FinalizationConfig(max_prefinal_repair_rounds=0)
+    )
+    blocker = {
+        "gap_id": "GAP-1234567890",
+        "category": "structure",
+        "related_topic": "global",
+        "missing_evidence": "required artifact",
+        "blocking": True,
+    }
+    deterministic["structural_issues"].append(blocker)
+    deterministic["repair_round_limit"] = 0
+    semantic = {
+        **deterministic,
+        "structural_issues": [{**blocker, "blocking": False}],
+        "semantic_gaps": [],
+    }
+    merged = merge_semantic_prefinal_audit(workspace, deterministic, semantic)
+    assert merged["status"] == "FAILED"
+    assert collect_blocking_gaps(merged)[0]["gap_id"] == "GAP-1234567890"
+    assert (workspace / PREFINAL_AUDIT_PATH).is_file()
 
 
 def test_finalizer_prompt_has_explicit_inputs_and_no_search(tmp_path: Path) -> None:
@@ -740,6 +823,41 @@ def test_fake_backend_end_to_end_finalization_and_complete_resume(
         workspace, 1, 1, 30, FakeBackend(), TopicExecutionConfig(), config
     )
     assert calls == [("slr-manager", "manager-finalize-1")]
+
+
+def test_complete_resume_reopens_when_prefinal_blocker_exists(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    state_path = workspace / "SLR_STATE.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["finalization"] = {"phase": "COMPLETE", "history": []}
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    audit_path = workspace / PREFINAL_AUDIT_PATH
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text(
+        json.dumps(
+            {
+                "structural_issues": [
+                    {
+                        "gap_id": "GAP-1234567890",
+                        "category": "structure",
+                        "blocking": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "slrharness.orchestrator._commit_finalization_artifacts", lambda *args: None
+    )
+    config = replace(FinalizationConfig(), enable_prefinal_audit=False)
+    assert not run_finalization_pipeline(
+        workspace, 1, 1, 30, FakeBackend(), TopicExecutionConfig(), config
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["finalization"]["phase"] == "AWAITING_INTERVENTION"
 
 
 def test_failed_validation_retries_only_finalizer(tmp_path: Path, monkeypatch) -> None:

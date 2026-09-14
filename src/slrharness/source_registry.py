@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from slrharness.contracts import SCHEMA_VERSION, atomic_write_json, atomic_write_text
+from slrharness.control_plane import current_issues
 from slrharness.prioritization import (
     PAPER_ROLES,
     PRIORITIZATION_PATH,
@@ -134,17 +136,50 @@ def _missing_allowed(value: Any) -> bool:
 
 def normalize_doi(value: Any) -> str:
     doi = str(value or "").strip().lower()
+    doi = doi.strip("[]<>{}")
     doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi)
     doi = doi.removeprefix("doi:").strip()
-    return "" if not doi or _missing_allowed(doi) else doi
+    doi = doi.rstrip(".,;")
+    if (
+        not doi
+        or _missing_allowed(doi)
+        or re.search(
+            r"\b(?:not reported|not found|not available|no doi|unknown|"
+            r"unverified|none|n/?a)\b",
+            doi,
+        )
+        or not re.fullmatch(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", doi)
+    ):
+        return ""
+    return doi
 
 
 def normalize_arxiv(value: Any) -> str:
     arxiv = str(value or "").strip().lower()
+    arxiv = arxiv.strip("[]<>{}()")
     arxiv = re.sub(r"^https?://arxiv\.org/(?:abs|pdf)/", "", arxiv)
-    arxiv = arxiv.removeprefix("arxiv:").removesuffix(".pdf")
+    arxiv = arxiv.removeprefix("arxiv:").split("?", 1)[0].split("#", 1)[0]
+    arxiv = arxiv.removesuffix(".pdf")
     arxiv = re.sub(r"v\d+$", "", arxiv).strip()
-    return "" if not arxiv or _missing_allowed(arxiv) else arxiv
+    if (
+        not arxiv
+        or _missing_allowed(arxiv)
+        or re.search(
+            r"\b(?:not reported|not found|not available|no arxiv|unknown|"
+            r"unverified|none|n/?a)\b",
+            arxiv,
+        )
+        or not re.fullmatch(
+            r"(?:\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*/\d{7})", arxiv
+        )
+    ):
+        return ""
+    return arxiv
+
+
+def _arxiv_from_doi(doi: str) -> str:
+    prefix = "10.48550/arxiv."
+    return normalize_arxiv(doi[len(prefix) :]) if doi.startswith(prefix) else ""
 
 
 def _normalized_title(value: Any) -> str:
@@ -158,12 +193,12 @@ def _stable_id(prefix: str, identity: str) -> str:
 
 def stable_paper_id(metadata: dict[str, Any]) -> str:
     doi = normalize_doi(metadata.get("doi"))
-    arxiv = normalize_arxiv(metadata.get("arxiv_id"))
+    arxiv = normalize_arxiv(metadata.get("arxiv_id")) or _arxiv_from_doi(doi)
     authors = metadata.get("authors", "")
     first_author = authors[0] if isinstance(authors, list) and authors else str(authors)
     identity = (
         f"doi:{doi}"
-        if doi
+        if doi and not _arxiv_from_doi(doi)
         else f"arxiv:{arxiv}"
         if arxiv
         else (
@@ -302,21 +337,18 @@ def validate_paper_note(
             ) != _canonical(metadata.get(key)):
                 result.errors.append(f"paper index and note disagree on {key}")
     if audit_item and audit_item.get("status") == "CORRECTED":
-        checked_fields = audit_item.get("checked_fields") or {}
-        # Agents sometimes emit checked_fields as a list of field names
-        # instead of a mapping field -> verification payload.
-        if isinstance(checked_fields, list):
-            result.warnings.append(
-                "corrected metadata checked_fields lists names only; "
-                "verified values could not be compared"
-            )
-            checked_fields = {}
-        if isinstance(checked_fields, dict):
-            for key, checked in checked_fields.items():
-                if (
-                    isinstance(checked, dict)
-                    and _present(checked.get("verified"))
-                    and _canonical(metadata.get(key)) != _canonical(checked["verified"])
+        corrected = audit_item.get("corrected_frontmatter") or {}
+        if not isinstance(corrected, dict):
+            result.errors.append("corrected_frontmatter must be an object")
+        else:
+            for key, expected in corrected.items():
+                if key not in CORRECTABLE_FRONTMATTER_FIELDS:
+                    result.warnings.append(
+                        f"ignored non-frontmatter correction field {key!r}"
+                    )
+                    continue
+                if _metadata_value(key, metadata.get(key)) != _metadata_value(
+                    key, expected
                 ):
                     result.errors.append(f"corrected metadata not applied for {key}")
     result.valid = not result.errors
@@ -326,7 +358,25 @@ def validate_paper_note(
 def _canonical(value: Any) -> str:
     if isinstance(value, list):
         return "|".join(_canonical(item) for item in value)
-    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+    text = unicodedata.normalize("NFC", str(value or "")).strip().casefold()
+    return re.sub(r"\s+", " ", text)
+
+
+CORRECTABLE_FRONTMATTER_FIELDS = {
+    "title", "authors", "year", "venue", "doi", "arxiv_id", "public_url",
+    "version", "version_group",
+}
+
+
+def _metadata_value(field: str, value: Any) -> Any:
+    if field == "doi":
+        return normalize_doi(value)
+    if field == "arxiv_id":
+        return normalize_arxiv(value)
+    if field == "authors":
+        values = value if isinstance(value, list) else str(value or "").split(";")
+        return tuple(_canonical(item) for item in values if _canonical(item))
+    return _canonical(value)
 
 
 def _section(body: str, heading: str) -> str:
@@ -351,29 +401,16 @@ def _manifest_topics(workspace: Path) -> list[tuple[str, dict[str, Any], Path]]:
 
 def aggregate_sources(workspace: Path) -> AggregationResult:
     """Rebuild all global source artifacts deterministically without deleting notes."""
-    # Older approved workspaces predate the compiled contract. Rebuild that
-    # derived artifact lazily so downstream agents receive the same stable path
-    # without requiring a workspace migration step.
-    if not (workspace / PRIORITIZATION_PATH).is_file() and (
-        workspace / "SCOPE.md"
-    ).is_file():
+    # Recompile this derived artifact from the immutable approved scope. This
+    # upgrades older/partial parser output without changing SCOPE.md itself.
+    if (workspace / "SCOPE.md").is_file():
         write_scope_prioritization(workspace)
 
     previous = _load_json(workspace / REGISTRY_PATH) or {}
-    previous_ids: dict[str, str] = {}
-    for paper in previous.get("papers", []):
-        if not isinstance(paper, dict):
-            continue
-        for note in paper.get("note_paths", []):
-            previous_ids[f"note:{note}"] = str(paper.get("source_id"))
-        if normalize_doi(paper.get("doi")):
-            previous_ids[f"doi:{normalize_doi(paper.get('doi'))}"] = str(
-                paper.get("source_id")
-            )
-        if normalize_arxiv(paper.get("arxiv_id")):
-            previous_ids[f"arxiv:{normalize_arxiv(paper.get('arxiv_id'))}"] = str(
-                paper.get("source_id")
-            )
+    previous_papers = [
+        paper for paper in previous.get("papers", []) if isinstance(paper, dict)
+    ]
+    issue_state = current_issues(workspace)
 
     raw_papers: list[dict[str, Any]] = []
     raw_technical: list[dict[str, Any]] = []
@@ -382,7 +419,8 @@ def aggregate_sources(workspace: Path) -> AggregationResult:
     topic_coverage: dict[str, dict[str, list[str]]] = {}
     topic_assessments: list[tuple[str, dict[str, Any]]] = []
 
-    for topic, manifest, _root in _manifest_topics(workspace):
+    legacy_topics = _manifest_topics(workspace)
+    for topic, manifest, _root in legacy_topics:
         topic_coverage.setdefault(topic, {"papers": [], "technical_sources": []})
         assessment = manifest.get("prioritization")
         if isinstance(assessment, dict):
@@ -425,6 +463,11 @@ def aggregate_sources(workspace: Path) -> AggregationResult:
                         "validation_status": "PASS" if validation.valid else "FAILED",
                         "validation_errors": validation.errors,
                         "validation_warnings": validation.warnings,
+                        # The compiler reconciles the latest finding and
+                        # correction-event state; it is authoritative over a
+                        # stale agent-authored frontmatter status.
+                        "metadata_status": item.get("metadata_check_status")
+                        or validation.metadata.get("metadata_status"),
                     }
                 )
                 raw_papers.append(metadata)
@@ -466,6 +509,83 @@ def aggregate_sources(workspace: Path) -> AggregationResult:
         elif Path(str(technical_index_value or "")).name != "NO_RESULTS.md":
             structural_issues.append(f"missing technical index for {topic}")
 
+    # New control-plane workspaces do not persist per-topic indexes/manifests.
+    # Discover their canonical notes from program-owned task paths. Legacy
+    # manifests above remain a read-only migration input.
+    covered = {_topic_key(topic) for topic, _manifest, _root in legacy_topics}
+    state = _load_json(workspace / "SLR_STATE.json") or {}
+    control = state.get("control") if isinstance(state.get("control"), dict) else {}
+    program_tasks = control.get("topic_tasks") if isinstance(control, dict) else {}
+    if not isinstance(program_tasks, dict):
+        program_tasks = {}
+    for task in program_tasks.values():
+        if not isinstance(task, dict) or task.get("status") not in {
+            "COMPLETE", "COMPLETE_WITH_WARNINGS"
+        }:
+            continue
+        topic_root = _topic_key(str(task.get("topic_path") or ""))
+        if not topic_root or topic_root in covered:
+            continue
+        synthesis = topic_root + ".md"
+        topic_coverage.setdefault(synthesis, {"papers": [], "technical_sources": []})
+        root = workspace / topic_root
+        paper_dir = root / "papers"
+        paper_notes = sorted(paper_dir.glob("*.md")) if paper_dir.is_dir() else []
+        for note_path in paper_notes:
+            if note_path.name.lower() in {"index.md", "no_results.md", "metadata_check.md"}:
+                continue
+            metadata, _body = parse_frontmatter(note_path)
+            relative = note_path.resolve().relative_to(workspace.resolve()).as_posix()
+            if not metadata.get("title") or not (
+                metadata.get("authors") or metadata.get("doi") or metadata.get("arxiv_id")
+            ):
+                structural_issues.append(f"invalid paper note identity: {relative}")
+                continue
+            canonical_id = stable_paper_id(metadata)
+            raw_papers.append(
+                {
+                    **metadata,
+                    "paper_id": canonical_id,
+                    "note_path": relative,
+                    "topic_path": synthesis,
+                    "validation_status": "PASS",
+                    "validation_errors": [],
+                    "validation_warnings": [],
+                    "metadata_status": (
+                        "UNRESOLVED"
+                        if any(
+                            issue.get("target") == relative
+                            and issue.get("status") != "verified_closed"
+                            for issue in issue_state.values()
+                        )
+                        else "PASS"
+                    ),
+                }
+            )
+            validations.append(
+                NoteValidation(relative, canonical_id, valid=True, metadata=metadata)
+            )
+        technical_dir = root / "technical_sources"
+        technical_notes = (
+            sorted(technical_dir.glob("*.md")) if technical_dir.is_dir() else []
+        )
+        for note_path in technical_notes:
+            if note_path.name.lower() in {"index.md", "no_results.md"}:
+                continue
+            metadata, _body = parse_frontmatter(note_path)
+            relative = note_path.resolve().relative_to(workspace.resolve()).as_posix()
+            if not metadata.get("title") or not metadata.get("url"):
+                structural_issues.append(f"invalid technical note identity: {relative}")
+                continue
+            raw_technical.append(
+                {
+                    **metadata,
+                    "source_id": stable_technical_id(metadata),
+                    "note_path": relative,
+                    "topic_path": synthesis,
+                }
+            )
+
     identity_to_ids: dict[str, set[str]] = {}
     paper_id_to_dois: dict[str, set[str]] = {}
     paper_id_to_arxiv: dict[str, set[str]] = {}
@@ -497,8 +617,14 @@ def aggregate_sources(workspace: Path) -> AggregationResult:
                 f"Paper ID {note_id} refers to multiple {label}: {identities_text}"
             )
 
-    papers, duplicates = _deduplicate_papers(raw_papers, previous_ids)
+    papers, paper_decisions = _deduplicate_papers(raw_papers, previous_papers)
     technical_sources, technical_duplicates = _deduplicate_technical(raw_technical)
+    duplicates = [
+        item
+        for item in paper_decisions
+        if item.get("canonical_id")
+        and item.get("merge_reason") in {"strong_match", "weak_match"}
+    ]
     duplicates.extend(technical_duplicates)
     for paper in papers:
         for topic in paper["topic_paths"]:
@@ -560,14 +686,32 @@ def aggregate_sources(workspace: Path) -> AggregationResult:
         ],
         "generated_at": _now(),
     }
+    dedup_errors = [
+        item for item in paper_decisions if item.get("severity") == "error"
+    ]
+    dedup_warnings = [
+        item
+        for item in paper_decisions
+        if item.get("merge_reason") in {"weak_match", "conflict_not_merged"}
+        or item.get("migration_warning")
+    ]
     dedup_audit = {
         "schema_version": SCHEMA_VERSION,
-        "status": "PASS",
+        "status": (
+            "FAILED"
+            if dedup_errors
+            else "PASS_WITH_WARNINGS"
+            if dedup_warnings
+            else "PASS"
+        ),
         "paper_input_count": len(raw_papers),
         "paper_output_count": len(papers),
         "technical_input_count": len(raw_technical),
         "technical_output_count": len(technical_sources),
         "duplicates": duplicates,
+        "decisions": [*paper_decisions, *technical_duplicates],
+        "warnings": dedup_warnings,
+        "errors": dedup_errors,
         "generated_at": _now(),
     }
     _write_json(workspace / REGISTRY_PATH, registry)
@@ -793,43 +937,159 @@ def _aggregate_research_lines(
 
 
 def _deduplicate_papers(
-    raw: list[dict[str, Any]], previous_ids: dict[str, str]
+    raw: list[dict[str, Any]], previous: list[dict[str, Any]] | dict[str, str]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Deduplicate without allowing weak keys to bridge strong identities."""
     groups: list[list[dict[str, Any]]] = []
-    keys_by_group: list[set[str]] = []
-    for item in raw:
+    decisions: list[dict[str, Any]] = []
+
+    def identity(item: dict[str, Any]) -> tuple[set[str], set[str]]:
         doi = normalize_doi(item.get("doi"))
-        arxiv = normalize_arxiv(item.get("arxiv_id"))
-        version = _canonical(item.get("version_group"))
-        keys = ({f"doi:{doi}"} if doi else set()) | (
-            {f"arxiv:{arxiv}"} if arxiv else set()
-        )
-        if version and not _missing_allowed(version):
-            keys.add(f"version:{version}")
-        if not doi and not arxiv:
-            authors = item.get("authors", "")
-            first = authors[0] if isinstance(authors, list) and authors else authors
-            keys.add(
-                f"fallback:{_normalized_title(item.get('title'))}|"
-                f"{_normalized_title(first)}"
+        explicit_arxiv = normalize_arxiv(item.get("arxiv_id"))
+        datacite_arxiv = _arxiv_from_doi(doi)
+        arxiv_ids = {value for value in (explicit_arxiv, datacite_arxiv) if value}
+        publisher_dois = {doi} if doi and not datacite_arxiv else set()
+        return arxiv_ids, publisher_dois
+
+    def group_identity(members: list[dict[str, Any]]) -> tuple[set[str], set[str]]:
+        arxiv_ids: set[str] = set()
+        publisher_dois: set[str] = set()
+        for member in members:
+            member_arxiv, member_dois = identity(member)
+            arxiv_ids.update(member_arxiv)
+            publisher_dois.update(member_dois)
+        return arxiv_ids, publisher_dois
+
+    def weak_key(item: dict[str, Any]) -> str:
+        authors = item.get("authors", "")
+        first = authors[0] if isinstance(authors, list) and authors else authors
+        title = _normalized_title(item.get("title"))
+        author = _normalized_title(first)
+        return f"{title}|{author}" if title and author else ""
+
+    for item in raw:
+        item_arxiv, item_dois = identity(item)
+        item_strong = bool(item_arxiv or item_dois)
+        strong_matches: list[int] = []
+        weak_match_index: int | None = None
+        for index, members in enumerate(groups):
+            group_arxiv, group_dois = group_identity(members)
+            arxiv_conflict = bool(
+                item_arxiv and group_arxiv and item_arxiv != group_arxiv
             )
-        matches = [
-            index for index, group_keys in enumerate(keys_by_group) if keys & group_keys
-        ]
-        if not matches:
+            doi_conflict = bool(item_dois and group_dois and item_dois != group_dois)
+            shared_strong = bool(
+                (item_arxiv & group_arxiv) or (item_dois & group_dois)
+            )
+            same_version = bool(
+                _canonical(item.get("version_group"))
+                and any(
+                    _canonical(item.get("version_group"))
+                    == _canonical(member.get("version_group"))
+                    for member in members
+                )
+            )
+            same_weak = bool(
+                weak_key(item)
+                and any(weak_key(item) == weak_key(member) for member in members)
+            )
+            if arxiv_conflict or doi_conflict:
+                if shared_strong or same_version or same_weak:
+                    decisions.append(
+                        {
+                            "kind": "paper",
+                            "merge_reason": "conflict_not_merged",
+                            "note_paths": sorted(
+                                {str(item.get("note_path")), *(
+                                    str(member.get("note_path")) for member in members
+                                )}
+                            ),
+                            "strong_identities": sorted(
+                                {*(f"arxiv:{v}" for v in item_arxiv | group_arxiv),
+                                 *(f"doi:{v}" for v in item_dois | group_dois)}
+                            ),
+                        }
+                    )
+                continue
+            if shared_strong:
+                strong_matches.append(index)
+                continue
+            if (
+                weak_match_index is None
+                and not item_strong
+                and not group_arxiv
+                and not group_dois
+                and same_weak
+            ):
+                weak_match_index = index
+                continue
+            if same_version:
+                decisions.append(
+                    {
+                        "kind": "paper",
+                        "merge_reason": "weak_match",
+                        "merged": False,
+                        "note_paths": sorted(
+                            {str(item.get("note_path")), *(
+                                str(member.get("note_path")) for member in members
+                            )}
+                        ),
+                        "warning": "version_group alone is insufficient to merge",
+                    }
+                )
+        if strong_matches:
+            target = strong_matches[0]
+            groups[target].append(item)
+            for other in reversed(strong_matches[1:]):
+                groups[target].extend(groups.pop(other))
+            match_reason = "strong_match"
+            match_index = target
+        elif weak_match_index is not None:
+            groups[weak_match_index].append(item)
+            match_reason = "weak_match"
+            match_index = weak_match_index
+        else:
             groups.append([item])
-            keys_by_group.append(keys)
-            continue
-        target = matches[0]
-        groups[target].append(item)
-        keys_by_group[target].update(keys)
-        for other in reversed(matches[1:]):
-            groups[target].extend(groups.pop(other))
-            keys_by_group[target].update(keys_by_group.pop(other))
+            match_index = None
+        if match_index is not None:
+            decisions.append(
+                {
+                    "kind": "paper",
+                    "merge_reason": match_reason,
+                    "note_paths": sorted(
+                        {str(member.get("note_path")) for member in groups[match_index]}
+                    ),
+                }
+            )
 
     output: list[dict[str, Any]] = []
-    duplicates: list[dict[str, Any]] = []
-    for members, keys in zip(groups, keys_by_group, strict=True):
+    used_source_ids: set[str] = set()
+    previous_records = previous if isinstance(previous, list) else []
+    legacy_previous_ids = previous if isinstance(previous, dict) else {}
+    for members in groups:
+        arxiv_ids, publisher_dois = group_identity(members)
+        if len(arxiv_ids) > 1 or len(publisher_dois) > 1:
+            # This is a defensive postcondition. The grouping algorithm above
+            # should make it unreachable, but never publish a lossy cluster.
+            decisions.append(
+                {
+                    "kind": "paper",
+                    "merge_reason": "conflict_not_merged",
+                    "severity": "error",
+                    "note_paths": sorted(
+                        str(item.get("note_path")) for item in members
+                    ),
+                    "strong_identities": sorted(
+                        {*(f"arxiv:{v}" for v in arxiv_ids),
+                         *(f"doi:{v}" for v in publisher_dois)}
+                    ),
+                }
+            )
+            # Preserve every input rather than silently discarding an identity.
+            for member in reversed(members[1:]):
+                groups.append([member])
+            members = members[:1]
+            arxiv_ids, publisher_dois = group_identity(members)
         canonical = max(
             members,
             key=lambda item: (
@@ -838,18 +1098,66 @@ def _deduplicate_papers(
                 bool(normalize_doi(item.get("doi"))),
             ),
         )
-        existing_id = next(
-            (
-                previous_ids[key]
-                for key in [
-                    *(f"note:{item.get('note_path')}" for item in members),
-                    *keys,
-                ]
-                if key in previous_ids
-            ),
-            None,
-        )
+        # Preserve all non-conflicting strong identifiers in the canonical row.
+        if arxiv_ids:
+            canonical = {**canonical, "arxiv_id": next(iter(arxiv_ids))}
+        if publisher_dois:
+            canonical = {**canonical, "doi": next(iter(publisher_dois))}
+
+        existing_id: str | None = None
+        current_notes = {str(item.get("note_path")) for item in members}
+        for old in previous_records:
+            old_id = str(old.get("source_id") or "")
+            old_arxiv, old_dois = identity(old)
+            conflicts = bool(
+                (old_arxiv and arxiv_ids and old_arxiv != arxiv_ids)
+                or (old_dois and publisher_dois and old_dois != publisher_dois)
+            )
+            shared = bool((old_arxiv & arxiv_ids) or (old_dois & publisher_dois))
+            if old_id and shared and not conflicts and old_id not in used_source_ids:
+                existing_id = old_id
+                break
+            if old_id and current_notes & set(map(str, old.get("note_paths", []))):
+                if not shared or conflicts or old_id in used_source_ids:
+                    decisions.append(
+                        {
+                            "kind": "paper",
+                            "merge_reason": "conflict_not_merged",
+                            "migration_warning": True,
+                            "old_source_id": old_id,
+                            "note_paths": sorted(current_notes),
+                        }
+                    )
+        if not previous_records:
+            existing_id = next(
+                (
+                    legacy_previous_ids[key]
+                    for key in [
+                        *(f"arxiv:{value}" for value in arxiv_ids),
+                        *(f"doi:{value}" for value in publisher_dois),
+                    ]
+                    if key in legacy_previous_ids
+                    and legacy_previous_ids[key] not in used_source_ids
+                ),
+                None,
+            )
         source_id = existing_id or stable_paper_id(canonical)
+        if source_id in used_source_ids:
+            decisions.append(
+                {
+                    "kind": "paper",
+                    "merge_reason": "conflict_not_merged",
+                    "severity": "error",
+                    "canonical_id": source_id,
+                    "note_paths": sorted(current_notes),
+                }
+            )
+            seed = "split:" + "|".join(sorted(current_notes))
+            suffix = 0
+            while source_id in used_source_ids:
+                source_id = _stable_id("P", f"{seed}:{suffix}")
+                suffix += 1
+        used_source_ids.add(source_id)
         research_line_ids = sorted(
             {
                 str(line_id)
@@ -915,15 +1223,31 @@ def _deduplicate_papers(
         }
         output.append(entry)
         if len(members) > 1:
-            duplicates.append(
+            reason = next(
+                (
+                    item["merge_reason"]
+                    for item in reversed(decisions)
+                    if item.get("note_paths") == entry["note_paths"]
+                    and item.get("merge_reason") in {"strong_match", "weak_match"}
+                ),
+                "strong_match",
+            )
+            decisions.append(
                 {
                     "kind": "paper",
                     "canonical_id": source_id,
                     "note_paths": entry["note_paths"],
-                    "matched_by": sorted(keys),
+                    "merge_reason": reason,
+                    "matched_by": sorted(
+                        [
+                            *(f"arxiv:{value}" for value in arxiv_ids),
+                            *(f"doi:{value}" for value in publisher_dois),
+                        ]
+                        or [f"fallback:{weak_key(canonical)}"]
+                    ),
                 }
             )
-    return sorted(output, key=lambda item: item["source_id"]), duplicates
+    return sorted(output, key=lambda item: item["source_id"]), decisions
 
 
 def _deduplicate_technical(

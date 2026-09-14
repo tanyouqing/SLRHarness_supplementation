@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +14,9 @@ from typing import Any
 from slrharness.contracts import SCHEMA_VERSION, atomic_write_json, atomic_write_text
 from slrharness.prioritization import PAPER_ROLES
 from slrharness.source_registry import (
+    CORRECTABLE_FRONTMATTER_FIELDS,
+    normalize_arxiv,
+    normalize_doi,
     parse_frontmatter,
     stable_paper_id,
     stable_technical_id,
@@ -21,6 +25,7 @@ from slrharness.source_registry import (
 PAPER_ARTIFACT_TYPE = "academic_paper_note"
 TECHNICAL_ARTIFACT_TYPE = "technical_source_note"
 METADATA_STATUSES = {"PASS", "CORRECTED", "UNRESOLVED", "NOT_CHECKED"}
+CORRECTION_STATUSES = {"pending", "applied", "resolved", "unresolved"}
 TECHNICAL_ROLES = {
     "implementation_detail",
     "official_system_description",
@@ -158,6 +163,83 @@ def _collision_target(path: Path, source: Path) -> Path:
         )
     ).hexdigest()[:8]
     return path.with_name(f"{path.stem}-{digest}{path.suffix}")
+
+
+def _filename_token(value: Any, fallback: str) -> str:
+    token = unicodedata.normalize("NFKD", str(value or "")).encode(
+        "ascii", "ignore"
+    ).decode()
+    token = re.sub(r"[^a-zA-Z0-9]+", "-", token).strip("-").lower()
+    return token[:48] or fallback
+
+
+def import_staged_notes(
+    workspace: Path,
+    paths: Any,
+    staging: Path,
+    *,
+    kind: str,
+    diagnostics: list[str] | None = None,
+) -> list[Path]:
+    """Import agent Markdown into program-selected canonical topic paths."""
+    if kind not in {"paper", "technical"}:
+        raise ValueError("kind must be paper or technical")
+    root = staging.resolve()
+    staging_root = (workspace / "artifacts" / "staging").resolve()
+    if not root.is_relative_to(staging_root):
+        raise ValueError("staging path escapes artifacts/staging")
+    destination = paths.paper_dir if kind == "paper" else paths.technical_dir
+    imported: list[Path] = []
+    for source in sorted(root.rglob("*.md")):
+        if not source.resolve().is_relative_to(root):
+            continue
+        metadata, _ = parse_frontmatter(source)
+        if source.name.lower() == "no_results.md":
+            filename = "NO_RESULTS.md"
+        elif kind == "paper":
+            identity = _paper_identity(metadata)
+            if identity is None:
+                continue
+            year = _filename_token(metadata.get("year"), "undated")
+            authors = str(metadata.get("authors") or "unknown")
+            first_author = _filename_token(re.split(r"[,;]", authors)[0], "unknown")
+            title = _filename_token(metadata.get("title"), "untitled")
+            filename = f"{year}-{first_author}-{title}.md"
+        else:
+            title = _filename_token(
+                metadata.get("title") or metadata.get("organization"), "source"
+            )
+            filename = f"{title}.md"
+        target = _collision_target(destination / filename, source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        text = source.read_text(encoding="utf-8")
+        ignored_fields = {
+            "task_id", "attempt", "round", "count", "paper_count",
+            "source_count", "completion_status", "status", "timestamp",
+            "pending_correction_count", "missing_steps", "finalization_phase",
+            "canonical_source_id", "canonical_output_path", "paper_id",
+            "source_id", "metadata_status", "note_status", "correction_state",
+        }
+        frontmatter = re.match(r"^---\s*\r?\n(.*?)\r?\n---", text, re.DOTALL)
+        removed: list[str] = []
+        if frontmatter:
+            kept = []
+            for line in frontmatter.group(1).splitlines():
+                key = line.split(":", 1)[0].strip().lower() if ":" in line else ""
+                if key in ignored_fields:
+                    removed.append(key)
+                else:
+                    kept.append(line)
+            if removed:
+                text = "---\n" + "\n".join(kept) + "\n---" + text[frontmatter.end():]
+                if diagnostics is not None:
+                    diagnostics.append(
+                        f"ignored agent control fields in {source.name}: "
+                        + ", ".join(sorted(set(removed)))
+                    )
+        atomic_write_text(target, text)
+        imported.append(target)
+    return imported
 
 
 def _discover_notes(
@@ -444,6 +526,7 @@ def _metadata_audit(
     paths: Any,
     papers: list[dict[str, Any]],
     report: dict[str, Any],
+    corrections: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     findings = _read_jsonl(paths.metadata_findings, report)
     legacy = _json_object(paths.audit_dir / "metadata_check.json")
@@ -476,6 +559,13 @@ def _metadata_audit(
         )
         if canonical:
             latest[canonical] = finding
+    corrections_by_note: dict[str, list[dict[str, Any]]] = {}
+    for request in corrections.values():
+        canonical = _resolve_finding_path(
+            workspace, request.get("note_path"), papers, report
+        )
+        if canonical:
+            corrections_by_note.setdefault(canonical, []).append(request)
     items: list[dict[str, Any]] = []
     for paper in papers:
         path = str(paper["note_path"])
@@ -486,6 +576,46 @@ def _metadata_audit(
                 f"invalid metadata status {status!r} for {path}; using NOT_CHECKED"
             )
             status = "NOT_CHECKED"
+        related = corrections_by_note.get(path, [])
+        request_statuses = {str(item.get("status")) for item in related}
+        if request_statuses & {"pending", "applied", "unresolved"}:
+            status = "UNRESOLVED"
+        elif status == "PASS" and "resolved" in request_statuses:
+            report["warnings"].append(
+                f"PASS finding for {path} conflicts with resolved correction history"
+            )
+            status = (
+                "CORRECTED"
+                if isinstance(finding.get("corrected_frontmatter"), dict)
+                and finding.get("corrected_frontmatter")
+                else "UNRESOLVED"
+            )
+        elif status == "CORRECTED" and "resolved" not in request_statuses:
+            report["warnings"].append(
+                f"CORRECTED finding for {path} has no resolved correction request"
+            )
+            status = "UNRESOLVED"
+        if status == "CORRECTED":
+            corrected = finding.get("corrected_frontmatter")
+            if not isinstance(corrected, dict) or not corrected:
+                report["warnings"].append(
+                    f"CORRECTED finding for {path} lacks corrected_frontmatter"
+                )
+                status = "UNRESOLVED"
+            else:
+                for field, expected in corrected.items():
+                    if field not in CORRECTABLE_FRONTMATTER_FIELDS:
+                        report["warnings"].append(
+                            f"ignored non-frontmatter corrected field {field!r}"
+                        )
+                        continue
+                    if _normalized_suggested(field, paper.get(field)) != (
+                        _normalized_suggested(field, expected)
+                    ):
+                        report["warnings"].append(
+                            f"resolved correction is not applied for {path}:{field}"
+                        )
+                        status = "UNRESOLVED"
         paper["metadata_check_status"] = status
         items.append(
             {
@@ -493,6 +623,9 @@ def _metadata_audit(
                 "paper_id": paper["paper_id"],
                 "status": status,
                 "checked_fields": finding.get("checked_fields", {}),
+                "corrected_frontmatter": finding.get(
+                    "corrected_frontmatter", {}
+                ),
                 "remaining_uncertainties": finding.get(
                     "remaining_uncertainties", []
                 ),
@@ -520,17 +653,104 @@ def _metadata_audit(
     }
 
 
-def _pending_corrections(path: Path, report: dict[str, Any]) -> list[dict[str, Any]]:
+def _normalized_correction_status(value: Any) -> str:
+    status = str(value or "").lower()
+    return "resolved" if status == "verified" else status
+
+
+def _normalized_suggested(field: str, value: Any) -> Any:
+    if field == "doi":
+        return normalize_doi(value)
+    if field == "arxiv_id":
+        return normalize_arxiv(value)
+    if field == "authors":
+        values = value if isinstance(value, list) else str(value or "").split(";")
+        return [
+            re.sub(r"\s+", " ", unicodedata.normalize("NFC", str(item)))
+            .strip()
+            .casefold()
+            for item in values
+        ]
+    return (
+        re.sub(r"\s+", " ", unicodedata.normalize("NFC", str(value or "")))
+        .strip()
+        .casefold()
+    )
+
+
+def correction_request_id(note_path: str, field: str, suggested: Any) -> str:
+    payload = json.dumps(
+        [note_path.replace("\\", "/"), field, _normalized_suggested(field, suggested)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return "CR-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12].upper()
+
+
+def _latest_corrections(
+    path: Path, report: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
     latest: dict[str, dict[str, Any]] = {}
     for request in _read_jsonl(path, report):
         request_id = str(request.get("request_id") or "")
-        if request_id:
-            latest[request_id] = request
+        status = _normalized_correction_status(request.get("status"))
+        field = str(request.get("field") or "")
+        if not request_id or status not in CORRECTION_STATUSES:
+            report["warnings"].append("ignored invalid correction request event")
+            continue
+        if field and field not in CORRECTABLE_FRONTMATTER_FIELDS:
+            report["warnings"].append(
+                f"ignored non-frontmatter correction field {field!r}"
+            )
+            continue
+        suggested_present = "suggested_value" in request
+        expected_id = (
+            correction_request_id(
+                str(request.get("note_path") or ""),
+                field,
+                request.get("suggested_value"),
+            )
+            if field and suggested_present
+            else request_id
+        )
+        if expected_id != request_id:
+            report["warnings"].append(
+                f"legacy/non-deterministic correction ID {request_id}; "
+                f"expected {expected_id}"
+            )
+        latest[request_id] = {**request, "status": status}
+    return latest
+
+
+def _pending_corrections(path: Path, report: dict[str, Any]) -> list[dict[str, Any]]:
+    latest = _latest_corrections(path, report)
     return [
         value
         for value in latest.values()
-        if str(value.get("status") or "").lower() == "pending"
+        if str(value.get("status") or "").lower() in {"pending", "applied"}
     ]
+
+
+def _check_jsonl_history(
+    workspace: Path, task_context: dict[str, Any], report: dict[str, Any]
+) -> None:
+    history = task_context.get("jsonl_history")
+    if not isinstance(history, dict):
+        return
+    for relative, expected in history.items():
+        if not isinstance(expected, dict):
+            continue
+        path = (workspace / str(relative)).resolve()
+        if not path.is_relative_to(workspace.resolve()) or not path.is_file():
+            report["errors"].append(f"JSONL history is missing: {relative}")
+            continue
+        size = int(expected.get("size", 0))
+        current = path.read_bytes()
+        prefix_hash = hashlib.sha256(current[:size]).hexdigest()
+        if len(current) < size or prefix_hash != str(expected.get("sha256")):
+            report["errors"].append(
+                f"JSONL history was truncated or overwritten: {relative}"
+            )
 
 
 def _prioritization(
@@ -751,6 +971,7 @@ def compile_topic_artifacts(
         or _json_object(paths.task_state)
         or {}
     )
+    _check_jsonl_history(workspace, task_context, report)
     task_line_id = str(task_context.get("research_line_id") or "")
     papers = _paper_entries(
         workspace,
@@ -795,8 +1016,18 @@ def compile_topic_artifacts(
     )
     if not synthesis_valid:
         report["errors"].append("topic synthesis is missing or too short")
-    audit = _metadata_audit(workspace, paths, papers, report)
-    pending = _pending_corrections(paths.correction_requests, report)
+    correction_state = _latest_corrections(paths.correction_requests, report)
+    audit = _metadata_audit(workspace, paths, papers, report, correction_state)
+    pending = [
+        request
+        for request in correction_state.values()
+        if request.get("status") in {"pending", "applied"}
+    ]
+    unresolved_corrections = [
+        request
+        for request in correction_state.values()
+        if request.get("status") == "unresolved"
+    ]
     prioritization = _prioritization(paths, agent_manifest, report)
     prior_process = (
         agent_manifest.get("process", {})
@@ -841,6 +1072,7 @@ def compile_topic_artifacts(
     material_partial = bool(
         audit["overall_status"] == "PARTIAL"
         or pending
+        or unresolved_corrections
         or process_failed
         or report["path_repairs"]
         or report["unresolved_paths"]

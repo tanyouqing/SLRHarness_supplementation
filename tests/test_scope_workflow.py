@@ -240,6 +240,28 @@ def test_incomplete_secondary_ordering_is_only_warning(tmp_path: Path) -> None:
     assert load_scope_state(workspace)["validation_warnings"]
 
 
+def test_partial_explicit_prioritization_contract_blocks_scope_ready(
+    tmp_path: Path,
+) -> None:
+    workspace = _project(tmp_path)
+
+    def missing_factor_rubric(backend, agent_name, prompt, cwd, timeout):
+        proposal = _proposal().replace(
+            "| REL | Scope relevance | Directness | Core to peripheral | scope evidence |",
+            "| REL | Scope relevance | Directness | | scope evidence |",
+        )
+        (cwd / "SCOPE_PROPOSAL.md").write_text(proposal, encoding="utf-8")
+        (cwd / "SCOPE_SOURCES.md").write_text(_sources(), encoding="utf-8")
+        return AgentExecutionResult(0, "", "")
+
+    assert not run_scope_preparation(
+        workspace, RecordingBackend(), 30, missing_factor_rubric
+    )
+    failure = str(load_scope_state(workspace)["failure"])
+    assert "PARTIAL" in failure
+    assert "lack a rubric" in failure
+
+
 def test_numbered_and_annotated_policy_headings_compile_on_approval(
     tmp_path: Path,
 ) -> None:

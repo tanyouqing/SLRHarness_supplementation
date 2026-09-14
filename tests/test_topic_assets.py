@@ -17,7 +17,7 @@ def test_topic_agent_definitions_and_skill_are_deployed(tmp_path: Path) -> None:
         tmp_path / ".claude" / "skills" / "slr-topic-research" / "SKILL.md"
     ).read_text(encoding="utf-8")
 
-    assert "  - Agent" in coordinator
+    assert "  - Agent" not in coordinator
     assert "mcp__arxiv__*" not in coordinator
     assert "SendMessage" not in coordinator.split("---", 2)[1]
     assert "mcp__arxiv__*" in academic
@@ -29,9 +29,12 @@ def test_topic_agent_definitions_and_skill_are_deployed(tmp_path: Path) -> None:
     assert "TAVILY_API_KEY=" not in coordinator + academic + checker + technical
     assert "WebSearch" not in manager
     assert "add an unregistered paper" in manager
-    assert "Evidence ID" in skill
-    assert "correction_requests.jsonl" in skill
-    assert "coordinator_manifest.json" in skill
+    assert "evidence" in skill.lower()
+    assert "ISSUES.jsonl" in skill
+    assert "SLR_STATE.json" in skill
     assert (
         tmp_path / ".claude" / "templates" / "technical-note.md"
+    ).is_file()
+    assert (
+        tmp_path / ".claude" / "templates" / "report-section-05.md"
     ).is_file()

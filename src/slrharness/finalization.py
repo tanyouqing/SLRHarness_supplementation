@@ -61,7 +61,7 @@ FINAL_TRANSITIONS = {
         "COMPLETE",
         "AWAITING_INTERVENTION",
     },
-    "COMPLETE": {"COMPLETE"},
+    "COMPLETE": {"COMPLETE", "AWAITING_INTERVENTION"},
     "AWAITING_INTERVENTION": {"TOPIC_RESEARCH_COMPLETE"},
 }
 
@@ -189,6 +189,108 @@ def completed_task_paths(tasks_md: Path) -> list[str]:
     )
 
 
+PREFINAL_GAP_SECTIONS = (
+    "structural_issues",
+    "coverage_gaps",
+    "evidence_gaps",
+    "metadata_gaps",
+    "semantic_gaps",
+    "recommended_repairs",
+)
+from slrharness.control_plane import blocking_issue_ids
+
+
+def collect_blocking_gaps(audit: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect unique blockers without trusting the summary status."""
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for section in PREFINAL_GAP_SECTIONS:
+        values = audit.get(section, [])
+        for item in values if isinstance(values, list) else []:
+            if not isinstance(item, dict) or item.get("blocking") is not True:
+                continue
+            key = str(item.get("gap_id") or _gap_id(
+                str(item.get("category") or "unknown"),
+                str(item.get("related_topic") or "global"),
+                str(item.get("missing_evidence") or "blocking gap"),
+            )).upper()
+            if key not in seen:
+                seen.add(key)
+                output.append(item)
+    return output
+
+
+def blocking_gap_summary(audit: dict[str, Any]) -> str:
+    labels = sorted(
+        {
+            f"{item.get('gap_id', 'UNKNOWN')}:{item.get('category', 'unknown')}"
+            for item in collect_blocking_gaps(audit)
+        }
+    )
+    return "unresolved pre-final blockers: " + ", ".join(labels)
+
+
+def _derive_prefinal_status(audit: dict[str, Any]) -> None:
+    blockers = collect_blocking_gaps(audit)
+    used = int(audit.get("repair_rounds_used", 0))
+    limit = int(audit.get("repair_round_limit", 0))
+    repair_available = not bool(audit.get("repair_unavailable"))
+    has_issues = any(audit.get(section) for section in PREFINAL_GAP_SECTIONS[:-1])
+    if blockers:
+        status = "REPAIR_REQUIRED" if used < limit and repair_available else "FAILED"
+    else:
+        status = "PASS_WITH_LIMITATIONS" if has_issues else "PASS"
+    audit["status"] = status
+    audit["repair_required"] = status == "REPAIR_REQUIRED"
+    audit["recommended_repairs"] = blockers
+
+
+def merge_semantic_prefinal_audit(
+    workspace: Path,
+    deterministic: dict[str, Any],
+    semantic: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep deterministic findings authoritative while adding semantic gaps."""
+    merged = dict(semantic)
+    for section in (
+        "structural_issues", "coverage_gaps", "evidence_gaps", "metadata_gaps"
+    ):
+        deterministic_items = deterministic.get(section, [])
+        semantic_items = semantic.get(section, [])
+        authoritative = [
+            item
+            for item in (
+                deterministic_items if isinstance(deterministic_items, list) else []
+            )
+            if isinstance(item, dict)
+        ]
+        known = {str(item.get("gap_id")) for item in authoritative}
+        semantic_section_items = (
+            semantic_items if isinstance(semantic_items, list) else []
+        )
+        additions = [
+            item
+            for item in semantic_section_items
+            if isinstance(item, dict) and str(item.get("gap_id")) not in known
+        ]
+        merged[section] = [*authoritative, *additions]
+    semantic_gaps = semantic.get("semantic_gaps", [])
+    semantic_gap_items = semantic_gaps if isinstance(semantic_gaps, list) else []
+    merged["semantic_gaps"] = [
+        item
+        for item in semantic_gap_items
+        if isinstance(item, dict)
+    ]
+    merged["schema_version"] = SCHEMA_VERSION
+    merged["repair_rounds_used"] = deterministic.get("repair_rounds_used", 0)
+    merged["repair_round_limit"] = deterministic.get("repair_round_limit", 0)
+    merged["repair_unavailable"] = deterministic.get("repair_unavailable", False)
+    merged["generated_at"] = _now()
+    _derive_prefinal_status(merged)
+    _write_json(workspace / PREFINAL_AUDIT_PATH, merged)
+    return merged
+
+
 def run_structural_prefinal_audit(
     workspace: Path, config: FinalizationConfig, repair_rounds_used: int = 0
 ) -> dict[str, Any]:
@@ -201,6 +303,14 @@ def run_structural_prefinal_audit(
     registry = _load_json(workspace / REGISTRY_PATH)
     note_audit = _load_json(workspace / NOTE_AUDIT_PATH)
     dedup = _load_json(workspace / DEDUP_AUDIT_PATH)
+    lifecycle = _load_json(workspace / "SLR_STATE.json") or {}
+    control_tasks = (lifecycle.get("control") or {}).get("topic_tasks") or {}
+    program_topic_paths = {
+        str(item.get("topic_path"))
+        for item in control_tasks.values()
+        if isinstance(item, dict)
+        and item.get("status") in {"COMPLETE", "COMPLETE_WITH_WARNINGS"}
+    } if isinstance(control_tasks, dict) else set()
 
     def gap(category: str, topic: str, missing: str, blocking: bool) -> dict[str, Any]:
         return {
@@ -231,7 +341,25 @@ def run_structural_prefinal_audit(
         manifest = workspace / topic / "coordinator_manifest.json"
         if not synthesis.is_file():
             structural.append(gap("structure", topic, "topic synthesis", True))
-        if not manifest.is_file() or _load_json(manifest) is None:
+        if topic in program_topic_paths:
+            paper_dir = workspace / topic / "papers"
+            technical_dir = workspace / topic / "technical_sources"
+            if not any(paper_dir.glob("*.md")):
+                structural.append(gap("structure", topic, "academic evidence", True))
+            if not any(technical_dir.glob("*.md")):
+                structural.append(gap("structure", topic, "technical evidence", True))
+            if synthesis.is_file():
+                synthesis_text = synthesis.read_text(encoding="utf-8")
+                note_names = [
+                    path.name
+                    for directory in (paper_dir, technical_dir)
+                    for path in directory.glob("*.md")
+                ]
+                if note_names and not any(name in synthesis_text for name in note_names):
+                    evidence.append(
+                        gap("traceability", topic, "supporting-note traceability", False)
+                    )
+        elif not manifest.is_file() or _load_json(manifest) is None:
             structural.append(gap("structure", topic, "coordinator manifest", True))
         elif synthesis.is_file():
             manifest_data = _load_json(manifest) or {}
@@ -258,6 +386,10 @@ def run_structural_prefinal_audit(
         structural.append(gap("paper_note", "global", "valid paper notes", True))
     if dedup is None:
         structural.append(gap("structure", "global", "deduplication audit", True))
+    elif dedup.get("status") == "FAILED":
+        structural.append(
+            gap("structure", "global", "successful source deduplication", True)
+        )
     if registry:
         for source_id in registry.get("unresolved_metadata", []):
             metadata.append(
@@ -316,33 +448,22 @@ def run_structural_prefinal_audit(
         for warning in ranking.get("warnings", []):
             coverage.append(gap("prioritization", "global", str(warning), False))
 
-    blocking = [
-        item
-        for item in [*structural, *coverage, *evidence, *metadata]
-        if item.get("blocking") is True
-    ]
-    can_repair = repair_rounds_used < config.max_prefinal_repair_rounds
-    if blocking and can_repair:
-        status = "REPAIR_REQUIRED"
-    elif structural and not config.allow_finalize_with_limitations:
-        status = "FAILED"
-    elif structural or coverage or evidence or metadata:
-        status = "PASS_WITH_LIMITATIONS"
-    else:
-        status = "PASS"
     result = {
         "schema_version": SCHEMA_VERSION,
-        "status": status,
+        "status": "PASS",
         "structural_issues": structural,
         "coverage_gaps": coverage,
         "evidence_gaps": evidence,
         "metadata_gaps": metadata,
-        "recommended_repairs": blocking if can_repair else [],
-        "repair_required": status == "REPAIR_REQUIRED",
+        "semantic_gaps": [],
+        "recommended_repairs": [],
+        "repair_required": False,
+        "repair_unavailable": False,
         "repair_rounds_used": repair_rounds_used,
         "repair_round_limit": config.max_prefinal_repair_rounds,
         "generated_at": _now(),
     }
+    _derive_prefinal_status(result)
     _write_json(workspace / PREFINAL_AUDIT_PATH, result)
     return result
 
@@ -400,13 +521,9 @@ def validate_prefinal_audit(workspace: Path) -> tuple[bool, list[str]]:
         "FAILED",
     }:
         errors.append("invalid pre-final audit status")
-    for section in (
-        "structural_issues",
-        "coverage_gaps",
-        "evidence_gaps",
-        "metadata_gaps",
-        "recommended_repairs",
-    ):
+    for section in PREFINAL_GAP_SECTIONS:
+        if section == "semantic_gaps" and section not in audit:
+            continue
         if not isinstance(audit.get(section), list):
             errors.append(f"pre-final audit {section} must be a list")
         else:
@@ -426,6 +543,10 @@ def validate_prefinal_audit(workspace: Path) -> tuple[bool, list[str]]:
         errors.append("pre-final audit repair_required must be boolean")
     elif audit.get("repair_required") != (audit.get("status") == "REPAIR_REQUIRED"):
         errors.append("pre-final audit repair_required disagrees with status")
+    expected = dict(audit)
+    _derive_prefinal_status(expected)
+    if audit.get("status") != expected.get("status"):
+        errors.append("pre-final audit status disagrees with blocking gaps and budget")
     return not errors, errors
 
 
@@ -443,6 +564,14 @@ def delivery_statistics(workspace: Path, registry: dict[str, Any]) -> dict[str, 
     partial = sum(
         item is not None and item.get("status") == "PARTIAL" for item in manifests
     )
+    lifecycle = _load_json(workspace / "SLR_STATE.json") or {}
+    control_tasks = (lifecycle.get("control") or {}).get("topic_tasks") or {}
+    if isinstance(control_tasks, dict):
+        partial += sum(
+            isinstance(item, dict)
+            and item.get("status") == "COMPLETE_WITH_WARNINGS"
+            for item in control_tasks.values()
+        )
     access_counts = {
         level: sum(paper.get("access") == level for paper in registry.get("papers", []))
         for level in ("full_text", "abstract_only", "metadata_only", "unavailable")
@@ -612,6 +741,30 @@ def validate_final_report(
     warnings: list[str] = []
     text = report_path.read_text(encoding="utf-8") if report_path.is_file() else ""
     registry = _load_json(workspace / REGISTRY_PATH) or {}
+    prefinal_value = _load_json(workspace / PREFINAL_AUDIT_PATH)
+    prefinal = prefinal_value or {}
+    blockers = collect_blocking_gaps(prefinal)
+    blocker_labels = sorted(
+        f"{item.get('gap_id')}:{item.get('category')}" for item in blockers
+    )
+    if blockers:
+        errors.append(
+            "unresolved pre-final blockers: " + ", ".join(blocker_labels)
+        )
+    ledger_blockers = blocking_issue_ids(workspace)
+    if ledger_blockers:
+        errors.append("open blocking issues: " + ", ".join(ledger_blockers))
+    lifecycle = _load_json(workspace / "SLR_STATE.json") or {}
+    control_tasks = (lifecycle.get("control") or {}).get("topic_tasks") or {}
+    if isinstance(control_tasks, dict):
+        incomplete = sorted(
+            str(item.get("task_id"))
+            for item in control_tasks.values()
+            if isinstance(item, dict)
+            and item.get("status") not in {"COMPLETE", "COMPLETE_WITH_WARNINGS"}
+        )
+        if incomplete:
+            errors.append("incomplete topic tasks: " + ", ".join(incomplete))
     if len(text.strip()) < 500:
         errors.append("canonical final report is missing or too short")
     positions = [text.find(heading) for heading in REQUIRED_HEADINGS]
@@ -821,6 +974,7 @@ def validate_final_report(
         "unverified_claim_markers": unverified_count,
         "paper_note_validation": NOTE_AUDIT_PATH,
         "prefinal_audit": PREFINAL_AUDIT_PATH,
+        "prefinal_blockers": blocker_labels,
         "repair_rounds_used": finalization_state(workspace).get(
             "repair_rounds_used", 0
         ),
