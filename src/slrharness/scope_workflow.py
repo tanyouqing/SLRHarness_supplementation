@@ -394,16 +394,16 @@ def _validate_scope_outputs_detailed(workspace: Path) -> tuple[list[str], list[s
             "Ranking Mode",
             "Missing-Data Policy",
         ):
+            # Accept standalone labels and compound headings such as
+            # "### 10.1 Ranking unit and primary grouping".
             if not re.search(
-                rf"^###\s+(?:[\d.)]+\s+)?{re.escape(label)}"
-                rf"(?:\s*\([^)]*\))?\s*$",
+                rf"^###\s+.*\b{re.escape(label)}\b",
                 policy,
                 re.MULTILINE | re.IGNORECASE,
             ):
                 errors.append(f"prioritization policy missing {label}")
         if not re.search(
-            r"^###\s+(?:[\d.)]+\s+)?(?:Priority Tiers|Primary Ordering)"
-            r"(?:\s*\([^)]*\))?\s*$",
+            r"^###\s+.*\b(?:Priority Tiers|Primary Ordering)\b",
             policy,
             re.MULTILINE | re.IGNORECASE,
         ):

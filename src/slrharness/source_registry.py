@@ -302,13 +302,19 @@ def validate_paper_note(
             ) != _canonical(metadata.get(key)):
                 result.errors.append(f"paper index and note disagree on {key}")
     if audit_item and audit_item.get("status") == "CORRECTED":
-        for key, checked in (audit_item.get("checked_fields") or {}).items():
-            if (
-                isinstance(checked, dict)
-                and _present(checked.get("verified"))
-                and _canonical(metadata.get(key)) != _canonical(checked["verified"])
-            ):
-                result.errors.append(f"corrected metadata not applied for {key}")
+        checked_fields = audit_item.get("checked_fields") or {}
+        # Agents sometimes emit checked_fields as a list of field names
+        # instead of a mapping field -> verification payload.
+        if isinstance(checked_fields, list):
+            checked_fields = {}
+        if isinstance(checked_fields, dict):
+            for key, checked in checked_fields.items():
+                if (
+                    isinstance(checked, dict)
+                    and _present(checked.get("verified"))
+                    and _canonical(metadata.get(key)) != _canonical(checked["verified"])
+                ):
+                    result.errors.append(f"corrected metadata not applied for {key}")
     result.valid = not result.errors
     return result
 

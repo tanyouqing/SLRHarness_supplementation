@@ -125,7 +125,8 @@ def _column(row: dict[str, str], *names: str) -> str:
     for name in names:
         value = normalized.get(re.sub(r"[^a-z0-9]", "", name.lower()))
         if value is not None:
-            return value.strip()
+            # Markdown tables often wrap IDs in backticks.
+            return value.strip().strip("`").strip()
     return ""
 
 
@@ -168,11 +169,20 @@ def compile_scope_prioritization(
             "ranking mode is missing or unsupported; using qualitative fallback"
         )
 
-    line_rows = _table(organization)
+    # Prefer the dedicated RL table (often under "### Ranking Unit").
+    # Section 5 organization tables may list groups only and must not win.
+    line_rows = _table(_subsection(policy, "Ranking Unit"))
+    if not any(
+        _column(row, "Research Line ID", "Line ID") or _column(row, "Research Line", "Line")
+        for row in line_rows
+    ):
+        line_rows = _table(organization)
+    if not line_rows:
+        line_rows = _table(policy)
     research_lines: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in line_rows:
-        name = _column(row, "Research Line", "Line", "Method Family")
+        name = _column(row, "Research Line", "Line", "Name", "Method Family")
         raw_id = _column(row, "Research Line ID", "Line ID")
         if not name and not raw_id:
             continue
@@ -196,7 +206,7 @@ def compile_scope_prioritization(
                 "group": _column(row, "Primary Group", "Group"),
                 "definition": _column(row, "Definition"),
                 "scope_question": _column(row, "Main Scope Question", "Scope Question"),
-                "priority_tier": _column(row, "Priority Tier", "Tier") or None,
+                "priority_tier": _column(row, "Priority Tier", "Tier", "Expected tier") or None,
                 "warnings": line_warnings,
             }
         )

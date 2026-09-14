@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import shlex
 import shutil
+import os
 import subprocess
 import time
 from collections.abc import Iterable
@@ -106,14 +107,30 @@ def new_window(session: str, window_name: str, cwd: Path | None = None) -> None:
 
 
 def send_command(session: str, window: str, command: str) -> None:
-    """Send a shell command (with Enter) to a specific tmux window."""
+    """Send a shell command (with Enter) to a specific tmux window.
+
+    Long or quote-heavy commands are written to a temp script first so
+    tmux send-keys does not choke on nested quoting or arg length.
+    """
+    # Threshold chosen well under typical ARG_MAX; short commands stay inline.
+    if len(command) > 2000 or "'" in command or "\\" in command:
+        script_dir = Path("/tmp/slrharness-tmux-cmds")
+        script_dir.mkdir(parents=True, exist_ok=True)
+        script = script_dir / f"{session}-{window}-{''.join(c if c.isalnum() else '-' for c in window)[:40]}-{abs(hash(command)) % 10**10}.sh"
+        # Unique name using pid + hash to avoid collisions across retries.
+        script = script_dir / f"{os.getpid()}-{abs(hash(command)) % 10**12}.sh"
+        script.write_text(command + "\n", encoding="utf-8")
+        script.chmod(0o700)
+        payload = f"bash {script}"
+    else:
+        payload = command
     subprocess.run(
         [
             "tmux",
             "send-keys",
             "-t",
             f"{session}:{window}",
-            command,
+            payload,
             "Enter",
         ],
         check=True,

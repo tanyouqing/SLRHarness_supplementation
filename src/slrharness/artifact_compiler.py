@@ -769,8 +769,10 @@ def compile_topic_artifacts(
         report,
         task_line_id,
     )
-    paper_no_results = (paths.paper_dir / "NO_RESULTS.md").is_file()
-    technical_no_results = (paths.technical_dir / "NO_RESULTS.md").is_file()
+    paper_no_result_path = paths.paper_dir / "NO_RESULTS.md"
+    technical_no_result_path = paths.technical_dir / "NO_RESULTS.md"
+    paper_no_results = paper_no_result_path.is_file()
+    technical_no_results = technical_no_result_path.is_file()
     if not papers and not paper_no_results:
         report["errors"].append("no recognizable paper notes or paper NO_RESULTS.md")
     if not technical and not technical_no_results:
