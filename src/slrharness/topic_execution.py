@@ -175,6 +175,8 @@ def initialize_topic_attempt(
     attempt: int,
     config: TopicExecutionConfig,
     previous_diagnostics: list[str] | None = None,
+    research_line_id: str | None = None,
+    prioritization_warnings: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Create directories and atomically record a coordinator attempt."""
     for directory in (paths.paper_dir, paths.technical_dir, paths.audit_dir):
@@ -193,6 +195,8 @@ def initialize_topic_attempt(
         "completed_at": None,
         "last_error": None,
         "diagnostics": list(previous_diagnostics or []),
+        "research_line_id": research_line_id,
+        "prioritization_warnings": list(prioritization_warnings or []),
         "process": {
             "kind": "tmux",
             "session": None,

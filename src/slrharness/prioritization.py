@@ -85,7 +85,7 @@ def _section(text: str, heading: str) -> str:
 
 def _subsection(text: str, heading: str) -> str:
     match = re.search(
-        rf"^###\s+(?:\d+[.)]\s*)?{re.escape(heading)}\s*$\r?\n(.*?)(?=^##{{2,3}}\s+|\Z)",
+        rf"^###\s+(?:[\d.)]+\s+)?{re.escape(heading)}(?:\s*\([^)]*\))?\s*$\r?\n(.*?)(?=^##{{2,3}}\s+|\Z)",
         text,
         re.MULTILINE | re.DOTALL | re.IGNORECASE,
     )

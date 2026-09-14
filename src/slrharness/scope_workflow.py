@@ -381,36 +381,37 @@ def _validate_scope_outputs_detailed(workspace: Path) -> tuple[list[str], list[s
         if missing:
             errors.append("proposal missing sections: " + ", ".join(missing))
         policy_match = re.search(
-            r"^##\s+(?:\d+[.)]\s*)?Research-Line Prioritization and Synthesis Policy\s*$"
+            r"^##\s+(?:[\d.)]+\s+)?Research-Line Prioritization and Synthesis Policy[^\n]*\n"
             r"(.*?)(?=^##\s+|\Z)",
             text,
             re.MULTILINE | re.DOTALL | re.IGNORECASE,
         )
-        policy = policy_match.group(1) if policy_match else ""
+        policy = policy_match.group(1).strip() if policy_match else ""
         for label in (
             "Ranking Unit",
             "Primary Grouping",
             "Ranking Mode",
             "Missing-Data Policy",
         ):
-            if not re.search(rf"^###\s+(?:\d+[.)]\s*)?{re.escape(label)}\s*$", policy, re.MULTILINE | re.IGNORECASE):
+            if not re.search(rf"^###\s+(?:[\d.)]+\s+)?{re.escape(label)}(?:\s*\([^)]*\))?\s*$", policy, re.MULTILINE | re.IGNORECASE):
                 errors.append(f"prioritization policy missing {label}")
-        if not re.search(r"^###\s+(?:\d+[.)]\s*)?(?:Priority Tiers|Primary Ordering)\s*$", policy, re.MULTILINE | re.IGNORECASE):
+        if not re.search(r"^###\s+(?:[\d.)]+\s+)?(?:Priority Tiers|Primary Ordering)(?:\s*\([^)]*\))?\s*$", policy, re.MULTILINE | re.IGNORECASE):
             errors.append("prioritization policy missing Priority Tiers or equivalent ordering")
         checklist = re.search(
-            r"^##\s+(?:\d+[.)]\s*)?.*Approval Checklist.*$\r?\n(.*?)(?=^##\s+|\Z)",
+            r"^##\s+(?:[\d.)]+\s+)?[^\n]*Approval Checklist[^\n]*\n"
+            r"(.*?)(?=^##\s+|\Z)",
             text,
             re.MULTILINE | re.DOTALL | re.IGNORECASE,
         )
-        checklist_text = checklist.group(1) if checklist else ""
+        checklist_text = checklist.group(1).strip() if checklist else ""
         if not re.search(r"prioriti[sz]|ranking|ordering", checklist_text, re.IGNORECASE):
             errors.append("Approval Checklist does not ask the user to confirm prioritization")
         if not re.search(r"RL-[A-Z0-9-]+", text):
             warnings.append("proposal defines no explicit Research Line ID")
-        if not re.search(r"^###\s+(?:\d+[.)]\s*)?Secondary Ordering\s*$", policy, re.MULTILINE | re.IGNORECASE):
+        if not re.search(r"^###\s+(?:[\d.)]+\s+)?Secondary Ordering(?:\s*\([^)]*\))?\s*$", policy, re.MULTILINE | re.IGNORECASE):
             warnings.append("prioritization policy has no Secondary Ordering")
         if not re.search(
-            r"^###\s+(?:\d+[.)]\s*)?Priority Factors\s*$",
+            r"^###\s+(?:[\d.)]+\s+)?Priority Factors(?:\s*\([^)]*\))?\s*$",
             policy,
             re.MULTILINE | re.IGNORECASE,
         ):
