@@ -397,13 +397,16 @@ def _validate_scope_outputs_detailed(workspace: Path) -> tuple[list[str], list[s
             # Accept standalone labels and compound headings such as
             # "### 10.1 Ranking unit and primary grouping".
             if not re.search(
-                rf"^###\s+.*\b{re.escape(label)}\b",
+                rf"^###\s+(?:[\d.)]+\s+)?(?:{re.escape(label)}\b|"
+                rf"[^\n]*(?:\band\b|[&/])\s*{re.escape(label)}\b)",
                 policy,
                 re.MULTILINE | re.IGNORECASE,
             ):
                 errors.append(f"prioritization policy missing {label}")
         if not re.search(
-            r"^###\s+.*\b(?:Priority Tiers|Primary Ordering)\b",
+            r"^###\s+(?:[\d.)]+\s+)?(?:Priority Tiers|Primary Ordering)\b|"
+            r"^###\s+(?:[\d.)]+\s+)?[^\n]*(?:\band\b|[&/])\s*"
+            r"(?:Priority Tiers|Primary Ordering)\b",
             policy,
             re.MULTILINE | re.IGNORECASE,
         ):

@@ -3,7 +3,12 @@
 import threading
 from pathlib import Path
 
-from slrharness.tmux_runner import WorkerSpec, _wrap_with_signal, wait_for_all
+from slrharness.tmux_runner import (
+    WorkerSpec,
+    _wrap_with_signal,
+    send_command,
+    wait_for_all,
+)
 
 
 def test_wrap_serializes_argv_and_records_exit_status() -> None:
@@ -19,6 +24,24 @@ def test_wrap_serializes_argv_and_records_exit_status() -> None:
     assert "slrharness_status=$?" in wrapped
     assert "result.status" in wrapped
     assert "tmux wait-for -S scope-done" in wrapped
+
+
+def test_quote_heavy_command_uses_a_self_removing_script(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls = []
+    monkeypatch.setattr("slrharness.tmux_runner.tempfile.gettempdir", lambda: tmp_path)
+    monkeypatch.setattr(
+        "slrharness.tmux_runner.subprocess.run",
+        lambda args, check: calls.append(args),
+    )
+    send_command("session", "topic", "claude -p 'quoted prompt'")
+    scripts = list((tmp_path / "slrharness-tmux-cmds").glob("*.sh"))
+    assert len(scripts) == 1
+    content = scripts[0].read_text(encoding="utf-8")
+    assert content.startswith("rm -f -- ")
+    assert "claude -p 'quoted prompt'" in content
+    assert calls[0][-2].startswith("bash ")
 
 
 def test_wait_for_all_registers_channels_concurrently(monkeypatch) -> None:

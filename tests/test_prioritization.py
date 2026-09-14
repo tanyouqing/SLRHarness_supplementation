@@ -72,6 +72,31 @@ def test_ordinal_scope_compiles_stable_lines_and_dimensions() -> None:
     assert contract["comparison_dimensions"][0]["dimension_id"] == "DIM-LATENCY"
 
 
+def test_compound_ranking_heading_prefers_its_research_line_table() -> None:
+    scope = _scope().replace(
+        "| Research Line ID | Research Line | Primary Group | Definition | "
+        "Main Scope Question | Priority Tier |\n"
+        "|---|---|---|---|---|---|\n"
+        "| RL-EXTERNAL-MEMORY | External memory | Memory architecture | "
+        "External stores | How is context retained? | Core |\n"
+        "| RL-REFLECTION | Reflection | Memory processing | Reflective "
+        "summaries | How is experience consolidated? | Supporting |",
+        "| Group | Description |\n|---|---|\n| Memory | Group summary only |",
+    ).replace(
+        "### Ranking Unit\nresearch_line",
+        "### 10.1 Ranking Unit and Primary Grouping\n"
+        "| Line ID | Name | Group | Expected tier |\n"
+        "|---|---|---|---|\n"
+        "| `RL-ONE` | First line | Memory | Core |\n"
+        "| `RL-TWO` | Second line | Memory | Supporting |",
+    )
+    contract = compile_scope_prioritization(scope)
+    assert [line["line_id"] for line in contract["research_lines"]] == [
+        "RL-ONE",
+        "RL-TWO",
+    ]
+
+
 def test_legacy_scope_degrades_without_zero_values() -> None:
     contract = compile_scope_prioritization(
         "## Ranking & Grouping Criteria\nGroup topics by mechanism and order qualitatively."

@@ -248,8 +248,10 @@ def test_numbered_and_annotated_policy_headings_compile_on_approval(
     def numbered_policy(backend, agent_name, prompt, cwd, timeout):
         proposal = (
             _proposal()
-            .replace("### Ranking Unit", "### 10.1 Ranking Unit")
-            .replace("### Primary Grouping", "### 10.2 Primary Grouping")
+            .replace(
+                "### Ranking Unit\nresearch_line\n### Primary Grouping",
+                "### 10.1 Ranking Unit and Primary Grouping\nresearch_line",
+            )
             .replace("### Ranking Mode", "### 10.3 Ranking Mode")
             .replace("### Priority Tiers", "### 10.6 Priority Tiers (ordinal)")
             .replace("### Missing-Data Policy", "### 10.9 Missing-Data Policy")

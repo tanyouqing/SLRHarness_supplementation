@@ -490,6 +490,21 @@ def test_corrected_metadata_must_match_note(tmp_path: Path) -> None:
     assert any("corrected metadata" in error for error in result.errors)
 
 
+def test_corrected_metadata_field_list_is_a_warning(tmp_path: Path) -> None:
+    note = tmp_path / "note.md"
+    _note(note, metadata_status="CORRECTED")
+    result = validate_paper_note(
+        tmp_path,
+        note,
+        audit_item={
+            "status": "CORRECTED",
+            "checked_fields": ["title"],
+        },
+    )
+    assert result.valid
+    assert any("lists names only" in warning for warning in result.warnings)
+
+
 def test_prefinal_pass_and_missing_synthesis_stable_gap(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     aggregate_sources(workspace)

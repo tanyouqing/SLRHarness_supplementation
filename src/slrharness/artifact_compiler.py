@@ -80,6 +80,10 @@ def _json_object(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _safe_no_result(path: Path, directory: Path) -> bool:
+    return path.is_file() and path.resolve().is_relative_to(directory.resolve())
+
+
 def _legacy_items(path: Path, key: str) -> list[dict[str, Any]]:
     value = _json_object(path)
     items = value.get(key, []) if value else []
@@ -630,18 +634,10 @@ def build_checkpoint_inventory(paths: Any) -> dict[str, Any]:
     missing: list[str] = []
     paper_no_result_path = paths.paper_dir / "NO_RESULTS.md"
     technical_no_result_path = paths.technical_dir / "NO_RESULTS.md"
-    paper_no_results = paper_no_result_path.is_file() and (
-        paper_no_result_path.resolve().is_relative_to(paths.paper_dir.resolve())
+    paper_no_results = _safe_no_result(paper_no_result_path, paths.paper_dir)
+    technical_no_results = _safe_no_result(
+        technical_no_result_path, paths.technical_dir
     )
-    technical_no_results = technical_no_result_path.is_file() and (
-        technical_no_result_path.resolve().is_relative_to(paths.technical_dir.resolve())
-    )
-    if paper_no_result_path.is_file() and not paper_no_results:
-        report["errors"].append("paper NO_RESULTS.md escapes its canonical directory")
-    if technical_no_result_path.is_file() and not technical_no_results:
-        report["errors"].append(
-            "technical NO_RESULTS.md escapes its canonical directory"
-        )
     if not paper_notes and not paper_no_results:
         missing.append("academic_research")
     elif paper_notes and finding_count == 0:
@@ -771,8 +767,16 @@ def compile_topic_artifacts(
     )
     paper_no_result_path = paths.paper_dir / "NO_RESULTS.md"
     technical_no_result_path = paths.technical_dir / "NO_RESULTS.md"
-    paper_no_results = paper_no_result_path.is_file()
-    technical_no_results = technical_no_result_path.is_file()
+    paper_no_results = _safe_no_result(paper_no_result_path, paths.paper_dir)
+    technical_no_results = _safe_no_result(
+        technical_no_result_path, paths.technical_dir
+    )
+    if paper_no_result_path.is_file() and not paper_no_results:
+        report["errors"].append("paper NO_RESULTS.md escapes its canonical directory")
+    if technical_no_result_path.is_file() and not technical_no_results:
+        report["errors"].append(
+            "technical NO_RESULTS.md escapes its canonical directory"
+        )
     if not papers and not paper_no_results:
         report["errors"].append("no recognizable paper notes or paper NO_RESULTS.md")
     if not technical and not technical_no_results:

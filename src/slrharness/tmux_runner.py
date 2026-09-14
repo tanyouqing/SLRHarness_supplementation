@@ -11,10 +11,11 @@ All functions shell out to the tmux binary — no Python tmux bindings required.
 
 from __future__ import annotations
 
+import os
 import shlex
 import shutil
-import os
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -114,27 +115,35 @@ def send_command(session: str, window: str, command: str) -> None:
     """
     # Threshold chosen well under typical ARG_MAX; short commands stay inline.
     if len(command) > 2000 or "'" in command or "\\" in command:
-        script_dir = Path("/tmp/slrharness-tmux-cmds")
+        script_dir = Path(tempfile.gettempdir()) / "slrharness-tmux-cmds"
         script_dir.mkdir(parents=True, exist_ok=True)
-        script = script_dir / f"{session}-{window}-{''.join(c if c.isalnum() else '-' for c in window)[:40]}-{abs(hash(command)) % 10**10}.sh"
-        # Unique name using pid + hash to avoid collisions across retries.
-        script = script_dir / f"{os.getpid()}-{abs(hash(command)) % 10**12}.sh"
-        script.write_text(command + "\n", encoding="utf-8")
+        descriptor, script_name = tempfile.mkstemp(
+            prefix=f"{os.getpid()}-", suffix=".sh", dir=script_dir
+        )
+        script = Path(script_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(f"rm -f -- {shlex.quote(str(script))}\n{command}\n")
         script.chmod(0o700)
-        payload = f"bash {script}"
+        payload = f"bash {shlex.quote(str(script))}"
     else:
+        script = None
         payload = command
-    subprocess.run(
-        [
-            "tmux",
-            "send-keys",
-            "-t",
-            f"{session}:{window}",
-            payload,
-            "Enter",
-        ],
-        check=True,
-    )
+    try:
+        subprocess.run(
+            [
+                "tmux",
+                "send-keys",
+                "-t",
+                f"{session}:{window}",
+                payload,
+                "Enter",
+            ],
+            check=True,
+        )
+    except Exception:
+        if script is not None:
+            script.unlink(missing_ok=True)
+        raise
 
 
 def wait_for_channel(channel: str, timeout: int) -> bool:

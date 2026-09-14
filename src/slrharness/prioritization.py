@@ -97,6 +97,17 @@ def _subsection(text: str, heading: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def _subsection_with_heading_label(text: str, heading: str) -> str:
+    """Read a subsection whose compound heading contains the requested label."""
+    match = re.search(
+        rf"^###\s+(?:[\d.)]+\s+)?[^\n]*\b{re.escape(heading)}\b[^\n]*$"
+        rf"\r?\n(.*?)(?=^##{{2,3}}\s+|\Z)",
+        text,
+        re.MULTILINE | re.DOTALL | re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else ""
+
+
 def _table(section: str) -> list[dict[str, str]]:
     rows = [
         line.strip()
@@ -171,14 +182,19 @@ def compile_scope_prioritization(
 
     # Prefer the dedicated RL table (often under "### Ranking Unit").
     # Section 5 organization tables may list groups only and must not win.
-    line_rows = _table(_subsection(policy, "Ranking Unit"))
-    if not any(
-        _column(row, "Research Line ID", "Line ID") or _column(row, "Research Line", "Line")
-        for row in line_rows
-    ):
-        line_rows = _table(organization)
-    if not line_rows:
-        line_rows = _table(policy)
+    ranking_unit_section = _subsection(policy, "Ranking Unit") or (
+        _subsection_with_heading_label(policy, "Ranking Unit")
+    )
+    line_rows: list[dict[str, str]] = []
+    for candidate in (ranking_unit_section, organization, policy):
+        rows = _table(candidate)
+        if any(
+            _column(row, "Research Line ID", "Line ID")
+            or _column(row, "Research Line", "Line")
+            for row in rows
+        ):
+            line_rows = rows
+            break
     research_lines: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in line_rows:
@@ -205,8 +221,13 @@ def compile_scope_prioritization(
                 "name": name or line_id,
                 "group": _column(row, "Primary Group", "Group"),
                 "definition": _column(row, "Definition"),
-                "scope_question": _column(row, "Main Scope Question", "Scope Question"),
-                "priority_tier": _column(row, "Priority Tier", "Tier", "Expected tier") or None,
+                "scope_question": _column(
+                    row, "Main Scope Question", "Scope Question"
+                ),
+                "priority_tier": _column(
+                    row, "Priority Tier", "Tier", "Expected tier"
+                )
+                or None,
                 "warnings": line_warnings,
             }
         )

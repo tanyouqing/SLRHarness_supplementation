@@ -414,7 +414,7 @@ def validate_prefinal_audit(workspace: Path) -> tuple[bool, list[str]]:
                 if not isinstance(item, dict):
                     errors.append(f"pre-final audit {section} contains a non-object")
                     continue
-                # Managers sometimes omit severity; treat as non-blocking default.
+                # Severity is optional; blocking remains the authoritative flag.
                 required = {"gap_id", "category", "blocking"}
                 if not required.issubset(item):
                     errors.append(f"pre-final audit {section} has an incomplete gap")

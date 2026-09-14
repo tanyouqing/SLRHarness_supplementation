@@ -306,6 +306,10 @@ def validate_paper_note(
         # Agents sometimes emit checked_fields as a list of field names
         # instead of a mapping field -> verification payload.
         if isinstance(checked_fields, list):
+            result.warnings.append(
+                "corrected metadata checked_fields lists names only; "
+                "verified values could not be compared"
+            )
             checked_fields = {}
         if isinstance(checked_fields, dict):
             for key, checked in checked_fields.items():
