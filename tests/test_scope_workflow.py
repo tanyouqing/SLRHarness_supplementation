@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -237,6 +238,36 @@ def test_incomplete_secondary_ordering_is_only_warning(tmp_path: Path) -> None:
         workspace, RecordingBackend(), 30, incomplete_rubric
     )
     assert load_scope_state(workspace)["validation_warnings"]
+
+
+def test_numbered_and_annotated_policy_headings_compile_on_approval(
+    tmp_path: Path,
+) -> None:
+    workspace = _project(tmp_path)
+
+    def numbered_policy(backend, agent_name, prompt, cwd, timeout):
+        proposal = (
+            _proposal()
+            .replace("### Ranking Unit", "### 10.1 Ranking Unit")
+            .replace("### Primary Grouping", "### 10.2 Primary Grouping")
+            .replace("### Ranking Mode", "### 10.3 Ranking Mode")
+            .replace("### Priority Tiers", "### 10.6 Priority Tiers (ordinal)")
+            .replace("### Missing-Data Policy", "### 10.9 Missing-Data Policy")
+        )
+        (cwd / "SCOPE_PROPOSAL.md").write_text(proposal, encoding="utf-8")
+        (cwd / "SCOPE_SOURCES.md").write_text(_sources(), encoding="utf-8")
+        return AgentExecutionResult(0, "", "")
+
+    assert run_scope_preparation(
+        workspace, RecordingBackend(), 30, numbered_policy
+    )
+    assert approve_scope(workspace, 1)
+    contract = json.loads(
+        (workspace / "artifacts/SCOPE_PRIORITIZATION.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert contract["ranking_mode"] == "ordinal"
 
 
 def test_wrong_revision_cannot_be_approved(tmp_path: Path) -> None:

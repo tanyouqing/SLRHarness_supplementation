@@ -238,7 +238,9 @@ def validate_paper_note(
         result.warnings.append("paper note has no research_line_ids")
     for line_id in line_ids:
         if str(line_id) not in known_lines:
-            result.warnings.append(f"paper note uses unknown Research Line ID {line_id}")
+            result.warnings.append(
+                f"paper note uses unknown Research Line ID {line_id}"
+            )
     role = str(metadata.get("primary_evidence_role") or "").lower()
     if not role:
         result.warnings.append("paper note has no primary_evidence_role")
@@ -255,7 +257,11 @@ def validate_paper_note(
     for label, pattern in required_sections.items():
         if not re.search(pattern, body, re.MULTILINE | re.IGNORECASE):
             result.errors.append(f"missing section: {label}")
-    if not re.search(r"^##\s+Scope-Driven Positioning\s*$", body, re.MULTILINE | re.IGNORECASE):
+    if not re.search(
+        r"^##\s+Scope-Driven Positioning\s*$",
+        body,
+        re.MULTILINE | re.IGNORECASE,
+    ):
         result.warnings.append("paper note has no Scope-Driven Positioning section")
     experiment_text = _section(body, "Data, experiments, and quantitative results")
     if not experiment_text.strip():
@@ -646,7 +652,9 @@ def _aggregate_research_lines(
 
     task_markers = _task_line_markers(workspace)
     topic_to_line: dict[str, str] = {}
-    assessment_by_topic = {_topic_key(topic): value for topic, value in topic_assessments}
+    assessment_by_topic = {
+        _topic_key(topic): value for topic, value in topic_assessments
+    }
     for topic in topic_coverage:
         key = _topic_key(topic)
         assessment = assessment_by_topic.get(key, {})
@@ -661,10 +669,19 @@ def _aggregate_research_lines(
         tier = str(assessment.get("proposed_tier") or "").strip()
         if tier:
             canonical = next(
-                (value for value in PRIORITY_TIERS if value.lower() == tier.lower()), tier
+                (
+                    value
+                    for value in PRIORITY_TIERS
+                    if value.lower() == tier.lower()
+                ),
+                tier,
             )
             line["proposed_tiers"].append(
-                {"topic_path": topic, "tier": canonical, "confidence": assessment.get("confidence")}
+                {
+                    "topic_path": topic,
+                    "tier": canonical,
+                    "confidence": assessment.get("confidence"),
+                }
             )
         for field in ("comparison_values", "factor_assessments"):
             values = assessment.get(field)
@@ -680,7 +697,9 @@ def _aggregate_research_lines(
             )
         for source_id in assessment.get("supporting_source_ids", []):
             line["technical_source_ids"].append(str(source_id))
-        line["warnings"].extend(str(value) for value in assessment.get("warnings", []) if value)
+        line["warnings"].extend(
+            str(value) for value in assessment.get("warnings", []) if value
+        )
 
     for paper in papers:
         explicit = paper.get("research_line_ids") or []
@@ -692,7 +711,11 @@ def _aggregate_research_lines(
             )
             associated.discard("")
         paper["research_line_ids"] = sorted(associated)
-        roles = paper.get("evidence_roles") if isinstance(paper.get("evidence_roles"), dict) else {}
+        roles = (
+            paper.get("evidence_roles")
+            if isinstance(paper.get("evidence_roles"), dict)
+            else {}
+        )
         for line_id in associated:
             line = ensure(line_id)
             if line is None:
@@ -719,7 +742,8 @@ def _aggregate_research_lines(
                 )
             if role not in PAPER_ROLES:
                 line["warnings"].append(
-                    f"paper {paper['source_id']} has invalid role {role!r}; treated as unassigned"
+                    f"paper {paper['source_id']} has invalid role {role!r}; "
+                    "treated as unassigned"
                 )
                 role = "unassigned"
             line["paper_roles"][role].append(paper["source_id"])
@@ -776,7 +800,8 @@ def _deduplicate_papers(
             authors = item.get("authors", "")
             first = authors[0] if isinstance(authors, list) and authors else authors
             keys.add(
-                f"fallback:{_normalized_title(item.get('title'))}|{_normalized_title(first)}"
+                f"fallback:{_normalized_title(item.get('title'))}|"
+                f"{_normalized_title(first)}"
             )
         matches = [
             index for index, group_keys in enumerate(keys_by_group) if keys & group_keys

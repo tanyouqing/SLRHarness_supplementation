@@ -258,15 +258,51 @@ supporting tree:
 topics/<topic>/<subtopic>.md                 # primary Manager input
 topics/<topic>/<subtopic>/
 ├── task.json                               # program-owned attempt/process state
+├── task_contract.json                      # program-owned paths and identity
 ├── papers/index.json                       # or papers/NO_RESULTS.md
 ├── papers/<stable-paper-slug>.md
 ├── technical_sources/index.json            # or NO_RESULTS.md
 ├── technical_sources/<stable-source-slug>.md
+├── audits/metadata_findings.jsonl           # checker observations
 ├── audits/metadata_check.json
 ├── audits/correction_requests.jsonl
+├── audits/artifact_normalization.json
+├── audits/checkpoint.json
 ├── coordination_log.jsonl
 └── coordinator_manifest.json
 ```
+
+Workers now own semantic evidence only: academic/technical Markdown notes,
+metadata findings and correction requests. The Coordinator owns the topic
+synthesis and coordination log. After every process outcome—including timeout
+or nonzero exit—the Python Artifact Compiler discovers notes inside that task
+root, safely flattens recoverable `papers/notes/` or
+`technical_sources/notes/` paths, generates stable IDs, recomputes counts, and
+writes the canonical indexes, metadata audit, checkpoint, normalization report,
+and manifest. Agent-written counts, task IDs, and manifests are treated as
+legacy input rather than authoritative state.
+
+Valid complete artifacts left by a timed-out/nonzero Coordinator are accepted
+as `PARTIAL` by default. A retry reads `audits/checkpoint.json` and is told to
+complete only `missing_steps`; existing notes are preserved. Disable recovery
+with `--no-accept-valid-artifacts-after-process-failure`.
+
+To inspect or rebuild one topic without Claude or tmux:
+
+```bash
+slrharness compile-topic --workspace workspaces/agent-memory \
+  --topic topics/memory/retrieval --dry-run
+slrharness compile-topic --workspace workspaces/agent-memory \
+  --topic topics/memory/retrieval
+```
+
+The dry run reports discovery and proposed repairs without moving or writing
+files. Inspect `audits/artifact_normalization.json` for actual repairs,
+generated IDs, imported legacy artifacts, warnings, and hard errors. Missing or
+short synthesis, no academic notes/no-result record, no technical
+notes/no-result record, unidentifiable notes, path escape, or an unbuildable
+audit remains `FAILED`. Recovered paths, incomplete metadata, missing evidence
+roles/prioritization, or recovered process failure normally becomes `PARTIAL`.
 
 The Manager treats only the task's top-level `.md` file as a topic. Supporting
 notes and audits may be consulted as evidence but are never counted as extra
@@ -275,6 +311,12 @@ index/no-result record, technical index/no-result record, metadata audit, task
 identity, paths, counts, and final status pass deterministic validation.
 Disclosed `PARTIAL` results are accepted by default; use
 `--no-allow-partial-completion` to reject them.
+
+New topic-coordinator runs use resource-conscious soft defaults: 4 included
+papers from at most 12 candidates, 1 technical source from at most 5 candidates,
+and 1 correction round. Citation chaining remains bounded to the most relevant
+1–2 seed papers and never recursively expands. CLI flags or explicit project
+configuration may raise these limits; legacy-worker execution is unchanged.
 
 Re-run the same command to resume. A previously accepted COMPLETE/PARTIAL task
 is not launched again; failed attempts retain valid notes and receive the last
@@ -286,7 +328,10 @@ override the global mode by starting its description with
 Search access is role-scoped: academic worker and metadata checker use
 scholarly/arXiv, then Tavily, then WebSearch/WebFetch; the technical worker uses
 Tavily plus WebSearch/WebFetch. No API key is written to project
-files. This implementation was exercised with Claude Code 2.1.269; use a
+files. Search snippets support discovery and cross-confirmation but are not
+final authoritative metadata; the checker prefers arXiv, DOI/publisher,
+official venue, and author/project pages. This implementation was exercised
+with Claude Code 2.1.269; use a
 current stable Claude Code release and verify agents/MCP connections before a
 real run.
 

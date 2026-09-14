@@ -32,3 +32,6 @@ def test_topic_agent_definitions_and_skill_are_deployed(tmp_path: Path) -> None:
     assert "Evidence ID" in skill
     assert "correction_requests.jsonl" in skill
     assert "coordinator_manifest.json" in skill
+    assert (
+        tmp_path / ".claude" / "templates" / "technical-note.md"
+    ).is_file()

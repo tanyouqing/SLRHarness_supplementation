@@ -1,4 +1,5 @@
 ---
+artifact_type: academic_paper_note
 paper_id: "P-<stable-doi-arxiv-or-title-key>"
 title: "<paper title>"
 authors: "<authors or Unavailable>"

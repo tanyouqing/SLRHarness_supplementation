@@ -18,6 +18,7 @@ from slrharness.topic_execution import (
     TOPIC_COORDINATOR,
     TopicExecutionConfig,
     build_coordinator_prompt,
+    initialize_topic_attempt,
     task_id_for_topic_path,
     topic_paths,
     validate_coordinator_outputs,
@@ -79,7 +80,30 @@ def write_valid_topic(
     else:
         paper_note = paths.paper_dir / "2024-smith-retrieval.md"
         paper_note.parent.mkdir(parents=True, exist_ok=True)
-        paper_note.write_text("# Paper note\n", encoding="utf-8")
+        paper_note.write_text(
+            """---
+artifact_type: academic_paper_note
+paper_id: "P-LOCAL"
+title: "Retrieval"
+authors: "Smith, A."
+year: "2024"
+doi: "10.1000/retrieval"
+access: full_text
+reading_status: depth_read
+metadata_status: PASS
+research_line_ids: ["RL-MEMORY-RETRIEVAL"]
+primary_evidence_role: "anchor"
+---
+# Retrieval
+## Problem and motivation
+Motivation.
+## Core method and contribution
+Method.
+## Evidence
+Evidence.
+""",
+            encoding="utf-8",
+        )
         paper_index = paths.paper_dir / "index.json"
         _write_json(
             paper_index,
@@ -96,7 +120,21 @@ def write_valid_topic(
         )
         technical_note = paths.technical_dir / "project-docs.md"
         technical_note.parent.mkdir(parents=True, exist_ok=True)
-        technical_note.write_text("# Technical note\n", encoding="utf-8")
+        technical_note.write_text(
+            """---
+artifact_type: technical_source_note
+title: "Project docs"
+organization: "Example"
+resource_type: official_documentation
+url: "https://example.invalid/docs"
+verification_status: verified
+---
+# Project docs
+## Technical content
+Content.
+""",
+            encoding="utf-8",
+        )
         technical_index = paths.technical_dir / "index.json"
         _write_json(
             technical_index,
@@ -171,6 +209,30 @@ def test_prompt_names_roles_parallel_and_file_corrections(tmp_path: Path) -> Non
     assert "Agent Team" in prompt
     assert "SCOPE_PRIORITIZATION.json" in prompt
     assert "RESEARCH LINE ID" in prompt
+
+
+def test_attempt_state_persists_research_line_context(tmp_path: Path) -> None:
+    paths = topic_paths(tmp_path, "topics/a/b")
+    state = initialize_topic_attempt(
+        paths,
+        "question",
+        2,
+        1,
+        TopicExecutionConfig(),
+        [],
+        "RL-A",
+        ("legacy fallback",),
+    )
+    assert state["research_line_id"] == "RL-A"
+    assert state["prioritization_warnings"] == ["legacy fallback"]
+    persisted = json.loads(paths.task_state.read_text(encoding="utf-8"))
+    assert persisted["research_line_id"] == "RL-A"
+    assert persisted["prioritization_warnings"] == ["legacy fallback"]
+    contract = json.loads(paths.task_contract.read_text(encoding="utf-8"))
+    assert contract["producer"] == "slrharness"
+    assert contract["task_id"] == paths.task_id
+    assert contract["research_line_id"] == "RL-A"
+    assert contract["paths"]["paper_directory"] == "topics/a/b/papers"
 
 
 def test_complete_and_missing_prioritization_are_nonfatal(tmp_path: Path) -> None:

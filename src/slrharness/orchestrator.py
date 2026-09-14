@@ -28,6 +28,7 @@ from slrharness.agent_backends import (
     available_backends,
     get_backend,
 )
+from slrharness.artifact_compiler import compile_topic_artifacts
 from slrharness.contracts import SCHEMA_VERSION, atomic_write_json
 from slrharness.finalization import (
     FINAL_AUDIT_PATH,
@@ -238,7 +239,8 @@ def parse_pending_tasks(tasks_md: Path) -> list[Task]:
                 research_line_id = value.upper()
                 if known_lines is not None and research_line_id not in known_lines:
                     task_warnings.append(
-                        f"unknown approved Research Line ID retained: {research_line_id}"
+                        "unknown approved Research Line ID retained: "
+                        f"{research_line_id}"
                     )
             else:
                 task_warnings.append(f"invalid line marker ignored: {value}")
@@ -772,12 +774,26 @@ def _execute_coordinator_batch(
     results: dict[str, CoordinatorProcessResult] = {}
     for spec in specs:
         invocation = by_window[spec.window_name]
-        results[invocation.task.topic_path] = CoordinatorProcessResult(
+        output = capture_pane(COORDINATOR_SESSION, spec.window_name)
+        exit_code = _read_agent_exit_code(spec.exit_status_path)
+        result = CoordinatorProcessResult(
             completed=completed[spec.window_name],
-            exit_code=_read_agent_exit_code(spec.exit_status_path),
+            exit_code=exit_code,
             timed_out=not completed[spec.window_name],
-            output=capture_pane(COORDINATOR_SESSION, spec.window_name),
+            output=output,
             pid=pids[spec.window_name],
+        )
+        results[invocation.task.topic_path] = result
+        _write_agent_run_record(
+            workspace,
+            f"coordinator-{invocation.task.topic_path.replace('/', '--')}-"
+            f"attempt-{invocation.attempt}",
+            "topic-coordinator",
+            invocation.prompt,
+            timeout,
+            result.completed,
+            exit_code,
+            output,
         )
     kill_session(COORDINATOR_SESSION)
     return results
@@ -810,6 +826,7 @@ def run_topic_coordinators(
         prior = _read_topic_state(paths.task_state)
         prior_status = prior.get("status") if prior else None
         if prior_status in {"COMPLETE", "PARTIAL"}:
+            compile_topic_artifacts(workspace, paths, config, None)
             validation = validate_coordinator_outputs(workspace, paths, config)
             if validation.accepted:
                 results[task.topic_path] = True
@@ -852,6 +869,8 @@ def run_topic_coordinators(
                 attempt,
                 config,
                 diagnostics,
+                task.research_line_id,
+                task.prioritization_warnings,
             )
             invocations.append(
                 CoordinatorInvocation(
@@ -876,18 +895,30 @@ def run_topic_coordinators(
             validation = None
             if process is None:
                 diagnostics.append("Coordinator executor returned no process result")
-            elif process.timed_out or not process.completed:
-                diagnostics.append("Coordinator process timed out")
-            elif process.exit_code != 0:
-                diagnostics.append(
-                    f"Coordinator exited with status {process.exit_code}"
-                )
+                compilation_process = CoordinatorProcessResult(False, None, False)
             else:
-                validation = validate_coordinator_outputs(workspace, paths, config)
-                diagnostics.extend(validation.errors)
-                diagnostics.extend(validation.warnings)
+                compilation_process = process
+                if process.timed_out or not process.completed:
+                    diagnostics.append("Coordinator process timed out")
+                elif process.exit_code != 0:
+                    diagnostics.append(
+                        f"Coordinator exited with status {process.exit_code}"
+                    )
+            compilation = compile_topic_artifacts(
+                workspace, paths, config, compilation_process
+            )
+            diagnostics.extend(compilation.errors)
+            diagnostics.extend(compilation.warnings)
+            validation = validate_coordinator_outputs(workspace, paths, config)
+            diagnostics.extend(validation.errors)
+            diagnostics.extend(validation.warnings)
 
             accepted = validation is not None and validation.accepted
+            if not accepted:
+                diagnostics.append(
+                    "Checkpoint inventory: "
+                    + json.dumps(compilation.checkpoint, ensure_ascii=False)
+                )
             status = validation.effective_status if accepted else "FAILED"
             state = states[task.topic_path]
             if process:
@@ -1572,6 +1603,7 @@ def run_slr(
 
 def _add_run_args(parser: argparse.ArgumentParser) -> None:
     """Add arguments shared between the top-level parser and the 'run' subcommand."""
+    topic_defaults = TopicExecutionConfig()
     parser.add_argument(
         "--workspace",
         type=Path,
@@ -1626,13 +1658,13 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--coordinator-timeout",
         type=int,
-        default=3600,
+        default=topic_defaults.coordinator_timeout_seconds,
         help="Shared timeout in seconds for a topic-coordinator batch.",
     )
     parser.add_argument(
         "--coordinator-retries",
         type=int,
-        default=1,
+        default=topic_defaults.coordinator_retries,
         help="Retries after a failed coordinator attempt (default: 1).",
     )
     parser.add_argument(
@@ -1641,11 +1673,34 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
         default=True,
         help="Accept disclosed PARTIAL coordinator output (default: enabled).",
     )
-    parser.add_argument("--target-papers", type=int, default=10)
-    parser.add_argument("--max-paper-candidates", type=int, default=30)
-    parser.add_argument("--target-technical-sources", type=int, default=5)
-    parser.add_argument("--max-technical-candidates", type=int, default=15)
-    parser.add_argument("--max-correction-rounds", type=int, default=2)
+    parser.add_argument(
+        "--target-papers", type=int, default=topic_defaults.target_papers
+    )
+    parser.add_argument(
+        "--max-paper-candidates",
+        type=int,
+        default=topic_defaults.max_paper_candidates,
+    )
+    parser.add_argument(
+        "--target-technical-sources",
+        type=int,
+        default=topic_defaults.target_technical_sources,
+    )
+    parser.add_argument(
+        "--max-technical-candidates",
+        type=int,
+        default=topic_defaults.max_technical_candidates,
+    )
+    parser.add_argument(
+        "--max-correction-rounds",
+        type=int,
+        default=topic_defaults.max_correction_rounds,
+    )
+    parser.add_argument(
+        "--accept-valid-artifacts-after-process-failure",
+        action=argparse.BooleanOptionalAction,
+        default=topic_defaults.accept_valid_artifacts_after_process_failure,
+    )
     parser.add_argument(
         "--finalization",
         action=argparse.BooleanOptionalAction,
@@ -1690,7 +1745,7 @@ def main(argv: list[str] | None = None) -> None:
     # Route to the right subparser. If the first token is a known subcommand
     # name, strip it and use that subparser; otherwise default to "run".
     subcommand = "run"
-    if argv and argv[0] in ("run", "status", "finalize"):
+    if argv and argv[0] in ("run", "status", "finalize", "compile-topic"):
         subcommand = argv[0]
         argv = argv[1:]
 
@@ -1707,6 +1762,46 @@ def main(argv: list[str] | None = None) -> None:
         )
         args = parser.parse_args(argv)
         print_status(args.workspace.resolve())
+        return
+
+    if subcommand == "compile-topic":
+        parser = argparse.ArgumentParser(
+            prog="slrharness.orchestrator compile-topic",
+            description="Compile canonical control artifacts for one topic.",
+        )
+        parser.add_argument("--workspace", type=Path, required=True)
+        parser.add_argument("--topic", required=True)
+        parser.add_argument("--dry-run", action="store_true")
+        args = parser.parse_args(argv)
+        workspace = args.workspace.resolve()
+        paths = topic_paths(workspace, args.topic)
+        result = compile_topic_artifacts(
+            workspace,
+            paths,
+            replace(TopicExecutionConfig(), mode=TOPIC_COORDINATOR),
+            None,
+            dry_run=args.dry_run,
+        )
+        print(
+            json.dumps(
+                {
+                    "compiled": result.compiled,
+                    "status": result.status,
+                    "errors": result.errors,
+                    "warnings": result.warnings,
+                    "recovered_paths": result.recovered_paths,
+                    "paper_count": result.paper_count,
+                    "technical_source_count": result.technical_source_count,
+                    "metadata_status": result.metadata_status,
+                    "checkpoint": result.checkpoint,
+                    "manifest": result.manifest,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        if not result.compiled:
+            raise SystemExit(1)
         return
 
     # "run" and explicit "finalize" (run remains the default for back-compat)
@@ -1743,6 +1838,9 @@ def main(argv: list[str] | None = None) -> None:
             target_technical_sources=args.target_technical_sources,
             max_technical_candidates=args.max_technical_candidates,
             max_correction_rounds=args.max_correction_rounds,
+            accept_valid_artifacts_after_process_failure=(
+                args.accept_valid_artifacts_after_process_failure
+            ),
         )
         final_config = FinalizationConfig(
             enabled=args.finalization,

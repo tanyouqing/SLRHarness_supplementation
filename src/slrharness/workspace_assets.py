@@ -16,7 +16,11 @@ CLAUDE_AGENT_FILES = (
     "technical-source-worker.md",
 )
 CLAUDE_SKILL_DIRS = ("slr-scoping", "slr-topic-research")
-CLAUDE_TEMPLATE_FILES = ("paper-note.md", "final-report.md")
+CLAUDE_TEMPLATE_FILES = (
+    "paper-note.md",
+    "technical-note.md",
+    "final-report.md",
+)
 
 
 def _plugins_root() -> Path:

@@ -35,6 +35,7 @@ def main(argv: list[str] | None = None) -> None:
             "  scope <prepare|resume|show|approve|revise|reject|init> ...\n"
             "  run --workspace PROJECT ...\n"
             "  finalize --workspace PROJECT ...\n"
+            "  compile-topic --workspace PROJECT --topic topics/... [--dry-run]\n"
             "  status PROJECT\n"
             "  validate PROJECT\n"
             "  config FILE\n"
@@ -54,7 +55,7 @@ def main(argv: list[str] | None = None) -> None:
         "init",
     }:
         scope.main([command, *rest])
-    elif command in {"run", "finalize"}:
+    elif command in {"run", "finalize", "compile-topic"}:
         orchestrator.main([command, *rest])
     elif command in {"doctor", "validate", "status"}:
         _diagnostic_command("validate" if command == "status" else command, rest)

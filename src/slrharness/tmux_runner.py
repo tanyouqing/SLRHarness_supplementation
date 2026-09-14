@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -219,13 +220,32 @@ def wait_for_all(
     workers. Workers run in parallel, so the wait time is the max of any
     single worker, not the sum.
     """
+    workers_list = list(workers)
+    if not workers_list:
+        return {}
+    # Register every wait concurrently. A worker can finish immediately after
+    # spawn; sequential registration risks losing a later window's signal
+    # while Python is still blocked on the first channel.
+    with ThreadPoolExecutor(max_workers=len(workers_list)) as executor:
+        futures = {
+            worker.window_name: executor.submit(
+                _wait_for_worker_completion, worker, timeout
+            )
+            for worker in workers_list
+        }
+        return {name: future.result() for name, future in futures.items()}
+
+
+def _wait_for_worker_completion(worker: WorkerSpec, timeout: int) -> bool:
+    """Prefer the durable status file; fall back to the tmux signal channel."""
+    if worker.exit_status_path is None:
+        return wait_for_channel(worker.done_channel, timeout)
     deadline = time.monotonic() + timeout
-    results: dict[str, bool] = {}
-    for worker in workers:
-        remaining = max(1, int(deadline - time.monotonic()))
-        completed = wait_for_channel(worker.done_channel, timeout=remaining)
-        results[worker.window_name] = completed
-    return results
+    while time.monotonic() < deadline:
+        if worker.exit_status_path.is_file():
+            return True
+        time.sleep(0.1)
+    return worker.exit_status_path.is_file()
 
 
 def _wrap_with_signal(worker: WorkerSpec) -> str:

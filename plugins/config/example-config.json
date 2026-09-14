@@ -7,11 +7,12 @@
   },
   "topic_execution": {
     "mode": "topic_coordinator",
-    "target_papers": 8,
-    "max_paper_candidates": 20,
-    "target_technical_sources": 3,
-    "max_technical_candidates": 8,
-    "max_correction_rounds": 2
+    "target_papers": 4,
+    "max_paper_candidates": 12,
+    "target_technical_sources": 1,
+    "max_technical_candidates": 5,
+    "max_correction_rounds": 1,
+    "accept_valid_artifacts_after_process_failure": true
   },
   "academic_worker": {"citation_chaining": "bounded"},
   "metadata_checker": {"content_checking": false},

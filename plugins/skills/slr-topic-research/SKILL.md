@@ -48,23 +48,26 @@ paper note must contain:
   table, figure, or paragraph), evidence type, access limitation, and whether
   the entry is reported fact, interpretation, or `[UNVERIFIED]`.
 
-Write `papers/index.json` with `schema_version: "1.0"`, `task_id`, `paper_count`, and `papers`. Each item
-contains `note_path`, title, authors, year, DOI, arXiv ID, status, access level,
-discovery route, version group, metadata-check status, inclusion status, and
-any exclusion reason. With zero reliable papers, write `papers/NO_RESULTS.md`
-describing providers attempted, reason, and limitations.
+Write only paper Markdown notes in the exact supplied `papers/` directory.
+Each note uses `artifact_type: academic_paper_note` and the simple
+`research_line_ids` list plus `primary_evidence_role`; do not use nested YAML.
+The Harness discovers notes and generates canonical IDs, paths, indexes, and
+counts. With zero reliable papers, write `papers/NO_RESULTS.md` describing
+providers attempted, reason, and limitations.
 
-Use bounded citation chaining only for the most relevant seed papers. Record
-the route and do not recursively expand without limit.
+Use bounded citation chaining only for the 1–2 most relevant seed papers.
+Record the route and do not recursively expand. Abstract-level notes are valid
+when full text is unavailable if access and evidentiary limits are disclosed.
 
 ## Metadata audit
 
-Write `audits/metadata_check.json` with `schema_version: "1.0"`, `task_id`, `checked_at`,
-`overall_status` (`PASS`, `PARTIAL`, `FAILED`), paper/checked/passed/corrected/
-unresolved counts, and `items`. Each item contains its note path, paper identity,
-status (`PASS`, `CORRECTED`, `UNRESOLVED`, `NOT_CHECKED`), checked fields with
-observed/verified/source values, correction requests, and remaining uncertainty.
-A zero-paper audit is valid and explains that no notes were produced.
+Write one JSON object per paper to `audits/metadata_findings.jsonl`. Each object
+contains its note path, status (`PASS`, `CORRECTED`, `UNRESOLVED`, or
+`NOT_CHECKED`), checked fields with observed/verified/source values, and
+remaining uncertainty. The Harness creates `metadata_check.json`, its readable
+summary, task ID, counts, and overall status. Search-result snippets are
+discovery/cross-check evidence, not final authoritative metadata; if no primary
+or official identity source is available, use UNRESOLVED or `[UNVERIFIED]`.
 
 The checker must not edit notes. Append JSON objects to
 `audits/correction_requests.jsonl` containing request ID, note path, field,
@@ -85,10 +88,10 @@ separately enumerated claims, implementation details,
 commands/configurations/APIs when applicable, related Paper IDs, relationship
 to academic work, topic relevance, reliability caveats, evidence locators, and
 verification status.
-Write `technical_sources/index.json` with `schema_version: "1.0"`, `task_id`, `source_count`, and
-`sources` containing note path, identity fields, status, access level,
-inclusion status, and exclusion reason. With zero reliable sources, write
-`technical_sources/NO_RESULTS.md` with attempted providers and limitations.
+Follow `.claude/templates/technical-note.md` and write only Markdown notes in
+the exact supplied `technical_sources/` directory. The Harness generates the
+stable Source IDs, canonical index, and counts. With zero reliable sources,
+write `technical_sources/NO_RESULTS.md` with attempted providers and limitations.
 
 ## Scope-driven research-line assessment
 
@@ -107,17 +110,16 @@ with comparison dimensions, factor assessments, proposed tier, confidence,
 missing evidence, and paper roles. The coordinator proposes only a local tier;
 the finalizer owns cross-line calibration. Missing or incomparable values stay
 unknown, never zero. Contradictory evidence must be retained regardless of
-narrative tier. The optional manifest `prioritization` object mirrors this
-assessment; incomplete prioritization is a warning and does not invalidate
+narrative tier. Optional `audits/coordinator_observations.json` may mirror this
+assessment. Its paper roles are a list of paper_id/research_line_id/role/reason
+records. Incomplete prioritization is a warning and does not invalidate
 otherwise complete research artifacts.
 
 ## Coordination and completion
 
 Append JSON lines to `coordination_log.jsonl` for role launch/completion,
-fallbacks, correction rounds, validation, and synthesis. The final
-`coordinator_manifest.json` contains `schema_version: "1.0"`, `task_id`, status (`COMPLETE`, `PARTIAL`,
-or `FAILED`), exact workspace-relative paths for synthesis, paper index or
-no-result record, technical index or no-result record, and metadata audit;
-paper/technical/checked/corrected/unresolved counts; limitations; timestamps;
-and roles invoked. Write it last. PARTIAL synthesis must visibly disclose every
-unresolved metadata or access limitation.
+fallbacks, correction rounds, and synthesis. Read the program-owned task
+contract and checkpoint but never modify them. Do not generate canonical
+indexes, aggregate audit, counts, manifest, or status: the Harness compiles
+those control artifacts after the Coordinator exits. PARTIAL synthesis must
+visibly disclose every unresolved metadata or access limitation.

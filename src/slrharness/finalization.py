@@ -219,7 +219,12 @@ def run_structural_prefinal_audit(
         structural.append(gap("structure", "global", "approved scope", True))
     if not (workspace / PRIORITIZATION_PATH).is_file():
         coverage.append(
-            gap("prioritization", "global", "compiled scope prioritization contract", False)
+            gap(
+                "prioritization",
+                "global",
+                "compiled scope prioritization contract",
+                False,
+            )
         )
     for topic in topics:
         synthesis = workspace / f"{topic}.md"
@@ -491,7 +496,11 @@ def ensure_stable_repair_tasks(workspace: Path, audit: dict[str, Any]) -> list[s
         topic_path = f"topics/gap-repair/{gap_id.lower()}"
         task = str(gap.get("recommended_task") or gap.get("missing_evidence"))
         related = str(gap.get("related_topic") or "").upper()
-        line_id = related if re.fullmatch(r"RL-[A-Z0-9-]+", related) else "NOT_APPLICABLE"
+        line_id = (
+            related
+            if re.fullmatch(r"RL-[A-Z0-9-]+", related)
+            else "NOT_APPLICABLE"
+        )
         lines.append(
             f"- [ ] {topic_path} -- [mode=topic_coordinator] [line={line_id}] "
             f"[{gap_id}] {task}"
@@ -669,7 +678,11 @@ def validate_final_report(
     unknown_line_ids = sorted(used_line_ids - known_line_ids)
     if unknown_line_ids:
         errors.append(f"unknown Research Line IDs: {unknown_line_ids}")
-    if re.search(r"\|\s*Order\s*\|\s*Paper ID\s*\|", prioritization_section, re.IGNORECASE):
+    if re.search(
+        r"\|\s*Order\s*\|\s*Paper ID\s*\|",
+        prioritization_section,
+        re.IGNORECASE,
+    ):
         errors.append("final report uses Paper ID as the primary ranking unit")
     if not re.search(
         r"not (?:a )?paper[- ]quality ranking",
@@ -687,14 +700,22 @@ def validate_final_report(
     ):
         errors.append("Section 3 does not reflect approved research-line grouping")
     contract = load_scope_prioritization(workspace)
-    if contract.get("compile_status") == "PARTIAL" or contract.get("ranking_mode") == "qualitative_fallback":
+    if (
+        contract.get("compile_status") == "PARTIAL"
+        or contract.get("ranking_mode") == "qualitative_fallback"
+    ):
         if re.search(
-            r"(?:objectively|objectively determined|deterministically)\s+(?:ranked|ordered)",
+            r"(?:objectively|objectively determined|deterministically)"
+            r"\s+(?:ranked|ordered)",
             prioritization_section,
             re.IGNORECASE,
         ):
-            errors.append("report claims objective ranking from a partial/qualitative contract")
-        warnings.append("prioritization uses a partial or qualitative fallback contract")
+            errors.append(
+                "report claims objective ranking from a partial/qualitative contract"
+            )
+        warnings.append(
+            "prioritization uses a partial or qualitative fallback contract"
+        )
     contradictory = {
         str(paper_id)
         for line in research_lines
@@ -727,7 +748,9 @@ def validate_final_report(
             try:
                 reported = float(tier_value)
             except (TypeError, ValueError):
-                warnings.append(f"research line {line_id} has no parseable composite score")
+                warnings.append(
+                    f"research line {line_id} has no parseable composite score"
+                )
             else:
                 if abs(reported - float(computed[line_id])) > 1e-6:
                     errors.append(f"weighted composite mismatch for {line_id}")

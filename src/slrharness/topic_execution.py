@@ -35,22 +35,23 @@ class TopicExecutionConfig:
     coordinator_retries: int = 1
     academic_agent: str = "academic-paper-worker"
     academic_max_turns: int = 35
-    target_papers: int = 10
-    max_paper_candidates: int = 30
+    target_papers: int = 4
+    max_paper_candidates: int = 12
     enable_backward_citation_search: bool = True
     enable_forward_citation_search: bool = True
     metadata_agent: str = "academic-metadata-checker"
     metadata_max_turns: int = 20
-    max_correction_rounds: int = 2
+    max_correction_rounds: int = 1
     unresolved_metadata_is_fatal: bool = False
     technical_agent: str = "technical-source-worker"
     technical_max_turns: int = 25
-    target_technical_sources: int = 5
-    max_technical_candidates: int = 15
+    target_technical_sources: int = 1
+    max_technical_candidates: int = 5
     message_wait_seconds: int = 300
     enable_send_message: bool = False
     persist_coordination_log: bool = True
     file_fallback: bool = True
+    accept_valid_artifacts_after_process_failure: bool = True
 
     def __post_init__(self) -> None:
         if self.mode not in TOPIC_EXECUTION_MODES:
@@ -104,11 +105,16 @@ class TopicPaths:
     synthesis: Path
     artifact_root: Path
     task_state: Path
+    task_contract: Path
     paper_dir: Path
     technical_dir: Path
     audit_dir: Path
     manifest: Path
     coordination_log: Path
+    metadata_findings: Path
+    correction_requests: Path
+    normalization_report: Path
+    checkpoint: Path
 
 
 @dataclass(frozen=True)
@@ -151,11 +157,20 @@ def topic_paths(workspace: Path, topic_path: str) -> TopicPaths:
         synthesis=synthesis,
         artifact_root=artifact_root,
         task_state=artifact_root / "task.json",
+        task_contract=artifact_root / "task_contract.json",
         paper_dir=artifact_root / "papers",
         technical_dir=artifact_root / "technical_sources",
         audit_dir=artifact_root / "audits",
         manifest=artifact_root / "coordinator_manifest.json",
         coordination_log=artifact_root / "coordination_log.jsonl",
+        metadata_findings=artifact_root / "audits" / "metadata_findings.jsonl",
+        correction_requests=(
+            artifact_root / "audits" / "correction_requests.jsonl"
+        ),
+        normalization_report=(
+            artifact_root / "audits" / "artifact_normalization.json"
+        ),
+        checkpoint=artifact_root / "audits" / "checkpoint.json",
     )
 
 
@@ -179,8 +194,41 @@ def initialize_topic_attempt(
     prioritization_warnings: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Create directories and atomically record a coordinator attempt."""
+    workspace = paths.artifact_root.parents[
+        len(Path(paths.topic_path).parts) - 1
+    ]
     for directory in (paths.paper_dir, paths.technical_dir, paths.audit_dir):
         directory.mkdir(parents=True, exist_ok=True)
+    for durable_log in (
+        paths.coordination_log,
+        paths.metadata_findings,
+        paths.correction_requests,
+    ):
+        durable_log.touch(exist_ok=True)
+    task_contract = {
+        "schema_version": SCHEMA_VERSION,
+        "producer": "slrharness",
+        "task_id": paths.task_id,
+        "topic_path": paths.topic_path,
+        "research_line_id": research_line_id,
+        "attempt": attempt,
+        "paths": {
+            "artifact_root": _workspace_relative(workspace, paths.artifact_root),
+            "paper_directory": _workspace_relative(workspace, paths.paper_dir),
+            "technical_directory": _workspace_relative(workspace, paths.technical_dir),
+            "metadata_findings": _workspace_relative(
+                workspace, paths.metadata_findings
+            ),
+            "correction_requests": _workspace_relative(
+                workspace, paths.correction_requests
+            ),
+            "coordination_log": _workspace_relative(
+                workspace, paths.coordination_log
+            ),
+            "synthesis": _workspace_relative(workspace, paths.synthesis),
+        },
+    }
+    _atomic_write_json(paths.task_contract, task_contract)
     state = {
         "schema_version": SCHEMA_VERSION,
         "task_id": paths.task_id,
@@ -259,6 +307,9 @@ def build_coordinator_prompt(
 ) -> str:
     """Build the complete per-task contract for the top-level coordinator."""
     diagnostics = retry_diagnostics or []
+    from slrharness.artifact_compiler import build_checkpoint_inventory
+
+    checkpoint = build_checkpoint_inventory(paths)
     contract = load_scope_prioritization(workspace)
     line_id = research_line_id or "NOT_APPLICABLE"
     line = next(
@@ -282,30 +333,57 @@ RESEARCH LINE ID: {line_id}
 RESEARCH LINE NAME: {line.get("name", "Not available")}
 PRIMARY GROUP: {line.get("group", "Not available")}
 RANKING MODE: {contract.get("ranking_mode", "qualitative_fallback")}
-COMPARISON DIMENSIONS: {json.dumps(contract.get("comparison_dimensions", []), ensure_ascii=False)}
+COMPARISON DIMENSIONS: {
+    json.dumps(contract.get("comparison_dimensions", []), ensure_ascii=False)
+}
 PAPER EVIDENCE ROLES: {json.dumps(contract.get("paper_roles", list(PAPER_ROLES)))}
-PRIORITIZATION INPUT WARNINGS: {json.dumps(list(prioritization_warnings), ensure_ascii=False)}
+PRIORITIZATION INPUT WARNINGS: {
+    json.dumps(list(prioritization_warnings), ensure_ascii=False)
+}
 LEGACY-COMPATIBLE TOPIC SYNTHESIS: {paths.synthesis}
 SUPPORTING ARTIFACT ROOT: {paths.artifact_root}
 PROGRAM-OWNED TASK STATE: {paths.task_state}
+PROGRAM-OWNED TASK CONTRACT: {paths.task_contract}
+EXACT PAPER NOTE DIRECTORY: {paths.paper_dir}
+CANONICAL PAPER NOTE DIRECTORY: {_workspace_relative(workspace, paths.paper_dir)}
+EXACT TECHNICAL NOTE DIRECTORY: {paths.technical_dir}
+CANONICAL TECHNICAL NOTE DIRECTORY: {
+    _workspace_relative(workspace, paths.technical_dir)
+}
+EXACT METADATA FINDINGS FILE: {paths.metadata_findings}
+EXACT CORRECTION REQUEST FILE: {paths.correction_requests}
+EXACT TOPIC SYNTHESIS: {paths.synthesis}
+CHECKPOINT INVENTORY: {json.dumps(checkpoint, ensure_ascii=False)}
 
 Read the approved scope, the task, existing supporting artifacts, and the
 preloaded `slr-topic-research` skill. Preserve valid files from earlier
 attempts. Never modify SCOPE.md, SCOPE_ORIGINAL.md, TASKS.md, SUMMARY.md,
-SLR_STATE.json, task.json, another topic, Git state, or harness configuration.
+SLR_STATE.json, task.json, task_contract.json, another topic, Git state, or
+harness configuration.
+
+PATH EXAMPLES:
+- Correct paper note: {paths.paper_dir / "2024-smith-example.md"}
+- Incorrect paper notes: `2024-smith-example.md`,
+  `{paths.artifact_root / "2024-smith-example.md"}`, and
+  `{paths.paper_dir / "notes" / "2024-smith-example.md"}`.
+- Correct technical note: {paths.technical_dir / "official-project-docs.md"}
+- Incorrect technical note: `{paths.artifact_root / "official-project-docs.md"}`.
 
 OUTER/INNER BOUNDARY:
 - You are the only top-level Claude CLI process for this topic.
-- Use the ordinary Claude Code `Agent` tool to invoke exactly these named
-  subagent types: `{config.academic_agent}`, `{config.technical_agent}`, and
+- When CHECKPOINT INVENTORY says their work is missing, use the ordinary Claude
+  Code `Agent` tool with only these named subagent types:
+  `{config.academic_agent}`, `{config.technical_agent}`, and
   `{config.metadata_agent}`. Do not create an Agent Team, team task list, or
   external Claude process.
-- Start `{config.academic_agent}` and `{config.technical_agent}` concurrently
-  as background subagents. Their write trees do not overlap.
+- On a fresh attempt, start `{config.academic_agent}` and
+  `{config.technical_agent}` concurrently as background subagents. On retry,
+  do not relaunch a role whose checkpoint step is already complete. Their write
+  trees do not overlap.
 - Wait at most {config.message_wait_seconds}s per bounded coordination step.
-- After the academic worker creates `papers/index.json` or an explicit
-  no-result record, invoke `{config.metadata_agent}` for independent metadata
-  verification.
+- After the academic worker creates paper notes or an explicit no-result
+  record, invoke `{config.metadata_agent}` only if metadata checking or
+  corrections remain incomplete.
 - Ordinary subagents cannot directly peer-message in the supported non-team
   mode. The checker writes `audits/correction_requests.jsonl`; you then invoke
   `{config.academic_agent}` again with only the pending corrections, and invoke
@@ -323,29 +401,30 @@ ACADEMIC WORK CONTRACT:
 - Bounded forward citation search: {config.enable_forward_citation_search}.
 - One stable `<year>-<first-author>-<short-title>.md` note per included paper,
   merging duplicate preprint/conference/journal versions.
-- Produce `papers/index.json` and `papers/INDEX.md`, or a clear no-result record.
+- Produce only `papers/*.md`, or a clear `papers/NO_RESULTS.md` record. The
+  Harness compiles indexes, IDs, counts, and canonical paths.
 
 TECHNICAL WORK CONTRACT:
 - Soft target {config.target_technical_sources} sources from at most
   {config.max_technical_candidates} candidates.
 - Keep technical evidence explicitly non-peer-reviewed unless it truly is a
-  paper. Produce one stable note per resource plus
-  `technical_sources/index.json` and `technical_sources/INDEX.md`, or a clear
-  no-result record.
+  paper. Produce only `technical_sources/*.md`, or a clear
+  `technical_sources/NO_RESULTS.md`. The Harness compiles the index and IDs.
 
 METADATA CHECK CONTRACT:
 - Independently check only title, authors, year, venue/publication, DOI, arXiv
   ID, URL, version relationships, duplicates, and note-to-paper identity.
 - Do not check methods, experiments, result numbers, conclusions, or analysis.
-- Write `audits/metadata_check.json` and a readable metadata_check.md. Valid
-  item statuses: PASS, CORRECTED, UNRESOLVED, NOT_CHECKED. Valid overall
-  statuses: PASS, PARTIAL, FAILED.
+- Append one finding per paper to `audits/metadata_findings.jsonl`. Valid item
+  statuses: PASS, CORRECTED, UNRESOLVED, NOT_CHECKED. The Harness calculates
+  the audit summary, counts, and overall status.
 
 REQUIRED FINAL OUTPUTS:
 - Existing-compatible synthesis: `{paths.synthesis}`.
-- Supporting tree under `{paths.artifact_root}` with paper index/no-result,
-  technical index/no-result, parseable metadata audit, coordination log, and
-  `coordinator_manifest.json`.
+- Agent-owned supporting output is limited to notes/no-result records,
+  metadata findings/correction requests, optional coordinator observations,
+  and the coordination log. The Harness generates canonical indexes, audit,
+  counts, normalization report, checkpoint, and manifest after this process.
 - The synthesis must distinguish papers from technical sources, link claims to
   supporting note paths, and disclose PARTIAL/UNRESOLVED metadata.
 - Add `## Scope-Driven Research-Line Assessment` to the synthesis with the
@@ -354,25 +433,23 @@ REQUIRED FINAL OUTPUTS:
   factor assessments, and paper evidence roles. `not_applicable` is allowed
   with a reason. This is a local assessment only; never claim a globally final
   rank. Missing values remain unknown rather than zero.
-- Write the manifest last, after validating all other outputs. Its task_id
-  must be exactly `{paths.task_id}`; status must be COMPLETE, PARTIAL,
-  or FAILED; paths must be workspace-relative. Include topic_synthesis,
-  academic_worker.index_path and paper_count,
-  metadata_checker.audit_path and overall_status,
-  technical_worker.index_path and source_count, limitations, and completed_at.
-- The manifest may add `prioritization` with research_line_id/name/group,
-  ranking_applicability, proposed_tier, confidence, comparison_values,
-  factor_assessments, paper_roles, supporting_source_ids, missing_evidence,
-  and warnings. Prioritization omissions are non-fatal and must be disclosed.
-- Every JSON artifact above must include `"schema_version": "1.0"`.
+- You may write optional `audits/coordinator_observations.json` containing only
+  proposed tier, confidence, factor/comparison observations, missing evidence,
+  and `paper_role_records` as a list of paper_id/research_line_id/role/reason
+  objects. Malformed or absent observations are non-fatal.
+- Do not calculate counts, create canonical indexes/audits/manifest, or fill
+  program task IDs. Do not modify any file whose producer is `slrharness`.
 
 MCP AND NETWORK FALLBACK:
 - Academic and metadata roles use configured scholarly/arXiv tools first. For
   an arXiv operation returning HTTP 429, make at most two attempts in total,
   then switch to Tavily. Also switch to Tavily when scholarly/arXiv tools are
   absent or fail. Only if Tavily fails, use WebSearch/WebFetch. The metadata
-  checker may treat Tavily search results themselves as authoritative evidence.
-  Technical work prefers configured Tavily, then WebSearch/WebFetch. Missing
+  checker uses Tavily/WebSearch only for discovery or cross-confirmation; an
+  ordinary search-result snippet alone is not authoritative metadata. Prefer
+  arXiv, DOI/publisher, venue, then author/project official pages. If only a
+  snippet is available, record UNRESOLVED or [UNVERIFIED]. Technical work
+  prefers configured Tavily, then WebSearch/WebFetch. Missing
   MCPs, rate limits, empty results, inaccessible pages, and missing Tavily keys
   are non-fatal.
 - If retrieval is unavailable, write explicit no-result/limited-access records.
@@ -382,9 +459,15 @@ MCP AND NETWORK FALLBACK:
 RETRY DIAGNOSTICS FROM THE HARNESS:
 {json.dumps(diagnostics, ensure_ascii=False, indent=2)}
 
-Before finishing, validate every required path and count. Do not claim success
-from subagent prose alone. Do not generate the global Summary or final review.
+Use CHECKPOINT INVENTORY as authoritative resume state. Do not repeat completed
+searches. Launch only roles needed for `missing_steps`, collect every background
+Agent handle before finishing, and complete only missing work. Do not generate
+the global Summary or final review.
 """
+
+
+def _workspace_relative(workspace: Path, path: Path) -> str:
+    return path.resolve().relative_to(workspace.resolve()).as_posix()
 
 
 def _load_json(path: Path, label: str, errors: list[str]) -> dict[str, Any] | None:
@@ -462,6 +545,10 @@ def validate_coordinator_outputs(
     synthesis_text = ""
     if not paths.synthesis.is_file():
         errors.append(f"missing topic synthesis: {paths.synthesis}")
+    elif not paths.synthesis.resolve().is_relative_to(
+        (workspace / "topics").resolve()
+    ):
+        errors.append("topic synthesis path escapes the topics tree")
     else:
         synthesis_text = paths.synthesis.read_text(encoding="utf-8")
         if len(synthesis_text.strip()) < 200:
@@ -478,6 +565,15 @@ def validate_coordinator_outputs(
             f"manifest task_id mismatch: expected {paths.task_id}, "
             f"got {manifest.get('task_id')!r}"
         )
+    harness_manifest = manifest.get("producer") == "slrharness"
+    if harness_manifest:
+        task_contract = _load_json(paths.task_contract, "task contract", errors)
+        if task_contract and task_contract.get("task_id") != paths.task_id:
+            errors.append("task contract task_id mismatch")
+        if not paths.normalization_report.is_file():
+            errors.append("missing artifact normalization report")
+        if not paths.checkpoint.is_file():
+            errors.append("missing checkpoint inventory")
     contract = load_scope_prioritization(workspace)
     known_lines = {
         str(item.get("line_id"))
@@ -681,11 +777,15 @@ def validate_coordinator_outputs(
             for item in papers:
                 note_value = item.get("note_path") if isinstance(item, dict) else None
                 note_path = _resolve_manifest_path(workspace, note_value)
-                topics_root = (workspace / "topics").resolve()
+                allowed_root = (
+                    paths.paper_dir.resolve()
+                    if harness_manifest
+                    else (workspace / "topics").resolve()
+                )
                 if (
                     note_path is None
                     or not note_path.is_file()
-                    or not note_path.is_relative_to(topics_root)
+                    or not note_path.is_relative_to(allowed_root)
                     or note_path.suffix.lower() != ".md"
                 ):
                     errors.append(f"invalid paper note path: {note_value!r}")
@@ -721,7 +821,10 @@ def validate_coordinator_outputs(
         if invalid_items:
             errors.append(f"metadata audit has invalid item statuses: {invalid_items}")
         derived = {
-            "checked_count": len(items),
+            "checked_count": sum(
+                isinstance(item, dict) and item.get("status") != "NOT_CHECKED"
+                for item in items
+            ),
             "passed_count": sum(
                 isinstance(item, dict) and item.get("status") == "PASS"
                 for item in items
@@ -786,11 +889,15 @@ def validate_coordinator_outputs(
             for item in sources:
                 note_value = item.get("note_path") if isinstance(item, dict) else None
                 note_path = _resolve_manifest_path(workspace, note_value)
-                topics_root = (workspace / "topics").resolve()
+                allowed_root = (
+                    paths.technical_dir.resolve()
+                    if harness_manifest
+                    else (workspace / "topics").resolve()
+                )
                 if (
                     note_path is None
                     or not note_path.is_file()
-                    or not note_path.is_relative_to(topics_root)
+                    or not note_path.is_relative_to(allowed_root)
                     or note_path.suffix.lower() != ".md"
                 ):
                     errors.append(f"invalid technical note path: {note_value!r}")

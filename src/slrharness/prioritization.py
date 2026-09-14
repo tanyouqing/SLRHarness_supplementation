@@ -46,7 +46,11 @@ class PrioritizationConfig:
     def __post_init__(self) -> None:
         if self.ranking_unit != "research_line":
             raise ValueError("prioritization.ranking_unit must be 'research_line'")
-        if self.default_mode not in {"ordinal", "numeric_dimension", "weighted_composite"}:
+        if self.default_mode not in {
+            "ordinal",
+            "numeric_dimension",
+            "weighted_composite",
+        }:
             raise ValueError("prioritization.default_mode is invalid")
         if self.missing_value_policy != "unknown_not_zero":
             raise ValueError(
@@ -85,7 +89,8 @@ def _section(text: str, heading: str) -> str:
 
 def _subsection(text: str, heading: str) -> str:
     match = re.search(
-        rf"^###\s+(?:[\d.)]+\s+)?{re.escape(heading)}(?:\s*\([^)]*\))?\s*$\r?\n(.*?)(?=^##{{2,3}}\s+|\Z)",
+        rf"^###\s+(?:[\d.)]+\s+)?{re.escape(heading)}"
+        rf"(?:\s*\([^)]*\))?\s*$\r?\n(.*?)(?=^##{{2,3}}\s+|\Z)",
         text,
         re.MULTILINE | re.DOTALL | re.IGNORECASE,
     )
@@ -93,7 +98,11 @@ def _subsection(text: str, heading: str) -> str:
 
 
 def _table(section: str) -> list[dict[str, str]]:
-    rows = [line.strip() for line in section.splitlines() if line.strip().startswith("|")]
+    rows = [
+        line.strip()
+        for line in section.splitlines()
+        if line.strip().startswith("|")
+    ]
     if len(rows) < 2:
         return []
     headers = [cell.strip() for cell in rows[0].strip("|").split("|")]
@@ -109,7 +118,10 @@ def _table(section: str) -> list[dict[str, str]]:
 
 
 def _column(row: dict[str, str], *names: str) -> str:
-    normalized = {re.sub(r"[^a-z0-9]", "", key.lower()): value for key, value in row.items()}
+    normalized = {
+        re.sub(r"[^a-z0-9]", "", key.lower()): value
+        for key, value in row.items()
+    }
     for name in names:
         value = normalized.get(re.sub(r"[^a-z0-9]", "", name.lower()))
         if value is not None:
@@ -125,7 +137,9 @@ def _first_value(section: str) -> str:
     return ""
 
 
-def compile_scope_prioritization(scope_text: str, source: str = "SCOPE.md") -> dict[str, Any]:
+def compile_scope_prioritization(
+    scope_text: str, source: str = "SCOPE.md"
+) -> dict[str, Any]:
     """Compile a tolerant, deterministic contract from a human-readable scope."""
     warnings: list[str] = []
     policy = _section(scope_text, "Research-Line Prioritization and Synthesis Policy")
@@ -150,7 +164,9 @@ def compile_scope_prioritization(scope_text: str, source: str = "SCOPE.md") -> d
     ranking_mode = ranking_mode.split()[0] if ranking_mode else ""
     if ranking_mode not in VALID_RANKING_MODES:
         ranking_mode = "qualitative_fallback"
-        warnings.append("ranking mode is missing or unsupported; using qualitative fallback")
+        warnings.append(
+            "ranking mode is missing or unsupported; using qualitative fallback"
+        )
 
     line_rows = _table(organization)
     research_lines: list[dict[str, Any]] = []
@@ -160,7 +176,11 @@ def compile_scope_prioritization(scope_text: str, source: str = "SCOPE.md") -> d
         raw_id = _column(row, "Research Line ID", "Line ID")
         if not name and not raw_id:
             continue
-        line_id = raw_id.upper() if VALID_LINE_ID.fullmatch(raw_id.upper()) else stable_research_line_id(name or raw_id)
+        line_id = (
+            raw_id.upper()
+            if VALID_LINE_ID.fullmatch(raw_id.upper())
+            else stable_research_line_id(name or raw_id)
+        )
         line_warnings: list[str] = []
         if not raw_id or raw_id.upper() != line_id:
             line_warnings.append("stable fallback ID generated from research-line name")
@@ -187,7 +207,8 @@ def compile_scope_prioritization(scope_text: str, source: str = "SCOPE.md") -> d
         if name:
             dimensions.append(
                 {
-                    "dimension_id": _column(row, "Dimension ID") or stable_research_line_id(name).replace("RL-", "DIM-", 1),
+                    "dimension_id": _column(row, "Dimension ID")
+                    or stable_research_line_id(name).replace("RL-", "DIM-", 1),
                     "name": name,
                     "description": _column(row, "Description"),
                     "value_type": _column(row, "Value Type", "Type") or "text",
@@ -201,7 +222,10 @@ def compile_scope_prioritization(scope_text: str, source: str = "SCOPE.md") -> d
         if not name:
             continue
         factor: dict[str, Any] = {
-            "factor_id": (_column(row, "Factor ID") or stable_research_line_id(name).replace("RL-", "F-", 1)).upper(),
+            "factor_id": (
+                _column(row, "Factor ID")
+                or stable_research_line_id(name).replace("RL-", "F-", 1)
+            ).upper(),
             "name": name,
             "meaning": _column(row, "Meaning"),
             "rubric": _column(row, "Operational rubric", "Rubric"),
@@ -230,7 +254,9 @@ def compile_scope_prioritization(scope_text: str, source: str = "SCOPE.md") -> d
     if ranking_mode == "weighted_composite":
         weights = [factor.get("weight") for factor in factors]
         if not factors or any(not isinstance(weight, float) for weight in weights):
-            warnings.append("weighted_composite factors do not define parseable weights")
+            warnings.append(
+                "weighted_composite factors do not define parseable weights"
+            )
         elif not math.isclose(sum(weights), 1.0, abs_tol=0.01):
             warnings.append("weighted_composite weights do not sum to approximately 1")
         if any(
@@ -258,14 +284,22 @@ def compile_scope_prioritization(scope_text: str, source: str = "SCOPE.md") -> d
     if not missing_policy_text:
         warnings.append("missing-data policy was defaulted to unknown_not_zero")
 
-    status = "COMPLETE" if policy and ranking_mode != "qualitative_fallback" else "PARTIAL"
+    status = (
+        "COMPLETE"
+        if policy and ranking_mode != "qualitative_fallback"
+        else "PARTIAL"
+    )
     if ranking_mode == "weighted_composite" and any(
         "weighted_composite" in warning for warning in warnings
     ):
         status = "PARTIAL"
     return {
         "prioritization_schema_version": PRIORITIZATION_SCHEMA_VERSION,
-        "ranking_unit": "research_line" if ranking_unit.lower().replace("-", "_") == "research_line" else ranking_unit,
+        "ranking_unit": (
+            "research_line"
+            if ranking_unit.lower().replace("-", "_") == "research_line"
+            else ranking_unit
+        ),
         "ranking_mode": ranking_mode,
         "numeric_dimension": _first_value(
             _subsection(policy, "Numeric Dimension")
@@ -290,8 +324,14 @@ def compile_scope_prioritization(scope_text: str, source: str = "SCOPE.md") -> d
     }
 
 
-def write_scope_prioritization(workspace: Path, scope_text: str | None = None) -> dict[str, Any]:
-    text = scope_text if scope_text is not None else (workspace / "SCOPE.md").read_text(encoding="utf-8")
+def write_scope_prioritization(
+    workspace: Path, scope_text: str | None = None
+) -> dict[str, Any]:
+    text = (
+        scope_text
+        if scope_text is not None
+        else (workspace / "SCOPE.md").read_text(encoding="utf-8")
+    )
     contract = compile_scope_prioritization(text)
     atomic_write_json(workspace / PRIORITIZATION_PATH, contract)
     return contract
@@ -361,7 +401,10 @@ def rank_research_lines(
                 )
     elif mode == "numeric_dimension":
         dimension = str(contract.get("numeric_dimension") or "")
-        descending = str(contract.get("numeric_direction") or "descending").lower() != "ascending"
+        descending = (
+            str(contract.get("numeric_direction") or "descending").lower()
+            != "ascending"
+        )
         for line in lines:
             line_id = str(line.get("line_id"))
             raw = (line.get("comparison_values") or {}).get(dimension)
@@ -379,7 +422,11 @@ def rank_research_lines(
                 (-value if descending else value, secondary_key(line), line_id)
             )
     elif mode == "weighted_composite":
-        factors = [factor for factor in contract.get("factors", []) if isinstance(factor, dict)]
+        factors = [
+            factor
+            for factor in contract.get("factors", [])
+            if isinstance(factor, dict)
+        ]
         weights = [factor.get("weight") for factor in factors]
         valid_factors = factors and all(
             isinstance(value, (int, float))
@@ -392,7 +439,9 @@ def rank_research_lines(
         if not valid_factors or not math.isclose(
             sum(float(value) for value in weights), 1.0, abs_tol=0.01
         ):
-            warnings.append("weighted composite is not computable from the approved factor weights")
+            warnings.append(
+                "weighted composite is not computable from the approved factor weights"
+            )
             unranked.extend(str(line.get("line_id")) for line in lines)
         else:
             for line in lines:
@@ -404,7 +453,11 @@ def rank_research_lines(
                     factor_id = str(factor.get("factor_id"))
                     raw = assessments.get(factor_id)
                     if isinstance(raw, list) and raw:
-                        raw = raw[0].get("value") if isinstance(raw[0], dict) else raw[0]
+                        raw = (
+                            raw[0].get("value")
+                            if isinstance(raw[0], dict)
+                            else raw[0]
+                        )
                     if isinstance(raw, dict):
                         raw = raw.get("score")
                     try:
@@ -427,10 +480,16 @@ def rank_research_lines(
                 scores[line_id] = total
                 ordered.append((-total, secondary_key(line), line_id))
                 claimed = line.get("composite_score")
-                if isinstance(claimed, (int, float)) and not math.isclose(float(claimed), total, abs_tol=1e-6):
-                    warnings.append(f"{line_id}: agent composite replaced by program value")
+                if isinstance(claimed, (int, float)) and not math.isclose(
+                    float(claimed), total, abs_tol=1e-6
+                ):
+                    warnings.append(
+                        f"{line_id}: agent composite replaced by program value"
+                    )
     else:
-        warnings.append(f"unsupported ranking mode {mode!r}; no preliminary order produced")
+        warnings.append(
+            f"unsupported ranking mode {mode!r}; no preliminary order produced"
+        )
         unranked.extend(str(line.get("line_id")) for line in lines)
     return {
         "mode": mode,
