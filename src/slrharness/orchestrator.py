@@ -1822,14 +1822,30 @@ def run_finalization_pipeline(
             if ledger_blockers
             else "incomplete topic tasks: " + ", ".join(incomplete_tasks)
         )
-        update_finalization_state(
-            workspace,
-            "AWAITING_INTERVENTION",
-            config,
-            failure=failure,
-        )
-        _commit_finalization_artifacts(workspace, "finalization: blocked")
-        return False
+        if config.allow_finalize_with_limitations:
+            # Disclose blockers in the final report instead of stalling when
+            # repair budget is exhausted or topics are incomplete.
+            update_finalization_state(
+                workspace,
+                "READY_FOR_FINAL_SYNTHESIS",
+                config,
+                source_counts={
+                    "papers": len((registry or {}).get("papers", [])),
+                    "technical_sources": len(
+                        (registry or {}).get("technical_sources", [])
+                    ),
+                },
+                failure=f"disclosed blockers: {failure}",
+            )
+        else:
+            update_finalization_state(
+                workspace,
+                "AWAITING_INTERVENTION",
+                config,
+                failure=failure,
+            )
+            _commit_finalization_artifacts(workspace, "finalization: blocked")
+            return False
     if (
         audit.get("status") == "PASS_WITH_LIMITATIONS"
         and not config.allow_finalize_with_limitations

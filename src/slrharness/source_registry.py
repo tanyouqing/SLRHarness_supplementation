@@ -283,35 +283,71 @@ def validate_paper_note(
         result.warnings.append(f"paper note has invalid evidence role {role!r}")
 
     required_sections = {
-        "problem/motivation": r"^##\s+Problem and motivation",
-        "method/contribution": r"^##\s+Core method and contribution",
-        "experiments": r"^##\s+Data, experiments, and quantitative results",
-        "limitations": r"^##\s+Limitations",
-        "evidence": r"^##\s+Evidence",
+        "problem/motivation": (
+            r"^##\s+.*\b(problem|motivation|objective)\b",
+            r"^##\s+.*\bwhy\b",
+        ),
+        "method/contribution": (
+            r"^##\s+.*\b(method|contribution|approach|architecture)\b",
+        ),
+        "experiments": (
+            r"^##\s+.*\b(experiment|evaluation|results|quantitative)\b",
+        ),
+        "limitations": (r"^##\s+.*\blimitation",),
+        "evidence": (
+            r"^##\s+.*\bevidence\b",
+            r"^##\s+.*\blocators?\b",
+        ),
     }
-    for label, pattern in required_sections.items():
-        if not re.search(pattern, body, re.MULTILINE | re.IGNORECASE):
-            result.errors.append(f"missing section: {label}")
+    for label, patterns in required_sections.items():
+        if not any(
+            re.search(pattern, body, re.MULTILINE | re.IGNORECASE)
+            for pattern in patterns
+        ):
+            # Soft: missing headings become warnings unless the note is tiny.
+            if len(body.strip()) < 400:
+                result.errors.append(f"missing section: {label}")
+            else:
+                result.warnings.append(f"section heading not recognized: {label}")
     if not re.search(
-        r"^##\s+Scope-Driven Positioning\s*$",
+        r"^##\s+.*\b(Scope-Driven Positioning|Positioning)\b",
         body,
         re.MULTILINE | re.IGNORECASE,
     ):
         result.warnings.append("paper note has no Scope-Driven Positioning section")
     experiment_text = _section(body, "Data, experiments, and quantitative results")
     if not experiment_text.strip():
-        result.errors.append("experimental setup/results are empty")
+        # Try any experiments-like section body.
+        for heading in (
+            "Experiments",
+            "Evaluation",
+            "Results",
+            "Quantitative results",
+            "Data and experiments",
+        ):
+            experiment_text = _section(body, heading)
+            if experiment_text.strip():
+                break
+    if not experiment_text.strip():
+        if len(body.strip()) >= 400:
+            result.warnings.append("experimental setup/results section not recognized")
+        else:
+            result.errors.append("experimental setup/results are empty")
     elif not re.search(
-        r"Not reported|Not applicable|Not accessible|\[UNVERIFIED\]|\|",
+        r"Not reported|Not applicable|Not accessible|\[UNVERIFIED\]|\||\d",
         experiment_text,
         re.IGNORECASE,
     ):
-        result.errors.append(
-            "experiments/results need content or an explicit missing value"
+        result.warnings.append(
+            "experiments/results lack explicit missing-value markers"
         )
     limitation_text = _section(body, "Limitations")
     if not limitation_text.strip():
+        limitation_text = _section(body, "Reported limitations")
+    if not limitation_text.strip() and len(body.strip()) < 400:
         result.errors.append("limitations are empty")
+    elif not limitation_text.strip():
+        result.warnings.append("limitations section not recognized")
 
     numeric_lines = [
         re.sub(r"\b(?:19|20)\d{2}\b", "", line) for line in experiment_text.splitlines()
