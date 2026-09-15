@@ -145,8 +145,8 @@ def _add_backend_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--scope-timeout",
         type=int,
-        default=900,
-        help="Scope-agent timeout in seconds (default: 900).",
+        default=1800,
+        help="Scope-agent timeout in seconds (default: 1800).",
     )
 
 

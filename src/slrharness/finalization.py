@@ -91,7 +91,7 @@ class FinalizationConfig:
     allow_finalize_with_limitations: bool = True
     validate_report: bool = True
     allow_complete_with_warnings: bool = True
-    finalizer_timeout_seconds: int = 1800
+    finalizer_timeout_seconds: int = 3600
     finalizer_retries: int = 1
 
     def __post_init__(self) -> None:

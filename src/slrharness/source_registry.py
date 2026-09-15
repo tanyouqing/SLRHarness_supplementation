@@ -114,6 +114,27 @@ def parse_frontmatter(path: Path) -> tuple[dict[str, Any], str]:
     return metadata, text[match.end() :]
 
 
+def write_frontmatter_field(path: Path, field: str, value: Any) -> bool:
+    """Programmatically set one top-level frontmatter field; keep body intact."""
+    text = path.read_text(encoding="utf-8")
+    match = re.match(r"^(---\s*\r?\n)(.*?)(\r?\n---\s*\r?\n)(.*)$", text, re.DOTALL)
+    if not match:
+        return False
+    raw = str(value if value is not None else "")
+    if re.search(r'[:#\[\]{}&*!|>%@`]', raw) or raw != raw.strip():
+        rendered = json.dumps(raw, ensure_ascii=False)
+    else:
+        rendered = raw
+    line = f"{field}: {rendered}"
+    fm = match.group(2)
+    if re.search(rf"^{re.escape(field)}\s*:", fm, re.MULTILINE):
+        fm2 = re.sub(rf"^{re.escape(field)}\s*:.*$", line, fm, count=1, flags=re.MULTILINE)
+    else:
+        fm2 = fm.rstrip("\n") + "\n" + line
+    path.write_text(match.group(1) + fm2 + match.group(3) + match.group(4), encoding="utf-8")
+    return True
+
+
 def _scalar(value: str) -> Any:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
         return value[1:-1]
