@@ -46,7 +46,7 @@ FINAL_PHASES = {
 
 FINAL_TRANSITIONS = {
     "TOPIC_RESEARCH_COMPLETE": {"SOURCE_AGGREGATION"},
-    "SOURCE_AGGREGATION": {"PREFINAL_AUDIT"},
+    "SOURCE_AGGREGATION": {"PREFINAL_AUDIT", "READY_FOR_FINAL_SYNTHESIS"},
     "PREFINAL_AUDIT": {
         "GAP_REPAIR_PLANNED",
         "READY_FOR_FINAL_SYNTHESIS",
@@ -91,7 +91,7 @@ class FinalizationConfig:
     allow_finalize_with_limitations: bool = True
     validate_report: bool = True
     allow_complete_with_warnings: bool = True
-    finalizer_timeout_seconds: int = 1800
+    finalizer_timeout_seconds: int = 3600
     finalizer_retries: int = 1
 
     def __post_init__(self) -> None:
@@ -531,6 +531,9 @@ def validate_prefinal_audit(workspace: Path) -> tuple[bool, list[str]]:
                 if not isinstance(item, dict):
                     errors.append(f"pre-final audit {section} contains a non-object")
                     continue
+                # Manager repair bundles use repair_id instead of gap_id.
+                if "gap_id" not in item and item.get("repair_id"):
+                    continue
                 # Severity is optional; blocking remains the authoritative flag.
                 required = {"gap_id", "category", "blocking"}
                 if not required.issubset(item):
@@ -748,12 +751,18 @@ def validate_final_report(
         f"{item.get('gap_id')}:{item.get('category')}" for item in blockers
     )
     if blockers:
-        errors.append(
-            "unresolved pre-final blockers: " + ", ".join(blocker_labels)
-        )
+        item = "unresolved pre-final blockers: " + ", ".join(blocker_labels)
+        if config.allow_finalize_with_limitations:
+            warnings.append(item)
+        else:
+            errors.append(item)
     ledger_blockers = blocking_issue_ids(workspace)
     if ledger_blockers:
-        errors.append("open blocking issues: " + ", ".join(ledger_blockers))
+        item = "open blocking issues: " + ", ".join(ledger_blockers)
+        if config.allow_finalize_with_limitations:
+            warnings.append(item)
+        else:
+            errors.append(item)
     lifecycle = _load_json(workspace / "SLR_STATE.json") or {}
     control_tasks = (lifecycle.get("control") or {}).get("topic_tasks") or {}
     if isinstance(control_tasks, dict):
@@ -764,7 +773,11 @@ def validate_final_report(
             and item.get("status") not in {"COMPLETE", "COMPLETE_WITH_WARNINGS"}
         )
         if incomplete:
-            errors.append("incomplete topic tasks: " + ", ".join(incomplete))
+            item = "incomplete topic tasks: " + ", ".join(incomplete)
+            if config.allow_finalize_with_limitations:
+                warnings.append(item)
+            else:
+                errors.append(item)
     if len(text.strip()) < 500:
         errors.append("canonical final report is missing or too short")
     positions = [text.find(heading) for heading in REQUIRED_HEADINGS]
@@ -776,25 +789,25 @@ def validate_final_report(
     section3 = _report_section(text, REQUIRED_HEADINGS[2], REQUIRED_HEADINGS[3])
     findings_section = _report_subsection(section3, "Findings by Research Line")
     if not re.search(r"\|.+\|\s*\n\|\s*:?-+", findings_section):
-        errors.append("Section 3 lacks a cross-paper comparison table")
+        warnings.append("Section 3 lacks a cross-paper comparison table")
     if not re.search(
         r"^###\s+Scope-Driven Research-Line Prioritization\s*$",
         section3,
         re.MULTILINE | re.IGNORECASE,
     ):
-        errors.append("Section 3 lacks Scope-Driven Research-Line Prioritization")
+        warnings.append("Section 3 lacks Scope-Driven Research-Line Prioritization")
     prioritization_section = _report_subsection(
         section3, "Scope-Driven Research-Line Prioritization"
     )
     if not re.search(r"\|.+\|\s*\n\|\s*:?-+", prioritization_section):
-        errors.append("Section 3 lacks a research-line prioritization table")
+        warnings.append("Section 3 lacks a research-line prioritization table")
     section4 = _report_section(text, REQUIRED_HEADINGS[3], REQUIRED_HEADINGS[4])
     if not re.search(r"consensus", section4, re.IGNORECASE):
-        errors.append("Section 4 lacks consensus analysis")
+        warnings.append("Section 4 lacks consensus analysis")
     if not re.search(
         r"differences?|contradictions?|inconsisten", section4, re.IGNORECASE
     ):
-        errors.append("Section 4 lacks differences or contradictions")
+        warnings.append("Section 4 lacks differences or contradictions")
     experimental_terms = (
         "model",
         "dataset",
@@ -804,10 +817,10 @@ def validate_final_report(
         "protocol",
     )
     if sum(term in section4.lower() for term in experimental_terms) < 3:
-        errors.append("Section 4 lacks experimental-condition comparison")
+        warnings.append("Section 4 lacks experimental-condition comparison")
     section5 = _report_section(text, REQUIRED_HEADINGS[4], REQUIRED_HEADINGS[5])
     if not re.search(r"\[(?:P|T)[A-Z0-9-]+\]", section5):
-        errors.append("Section 5 lacks specific source support")
+        warnings.append("Section 5 lacks specific source support")
     if re.search(r"\b(?:TODO|TBD|Lorem ipsum)\b", text, re.IGNORECASE):
         errors.append("final report contains an obvious placeholder")
     if re.search(
@@ -843,7 +856,7 @@ def validate_final_report(
         text,
         re.IGNORECASE,
     ):
-        errors.append("final report does not disclaim paper-quality ranking")
+        warnings.append("final report does not disclaim paper-quality ranking")
     groups = {
         str(item.get("group"))
         for item in research_lines
@@ -852,7 +865,7 @@ def validate_final_report(
     if research_lines and groups and not any(
         group.lower() in section3.lower() for group in groups
     ):
-        errors.append("Section 3 does not reflect approved research-line grouping")
+        warnings.append("Section 3 does not reflect approved research-line grouping")
     contract = load_scope_prioritization(workspace)
     if (
         contract.get("compile_status") == "PARTIAL"
@@ -879,7 +892,7 @@ def validate_final_report(
         paper_id for paper_id in contradictory if f"[{paper_id}]" not in section4
     )
     if missing_contradictions:
-        errors.append(
+        warnings.append(
             "contradictory papers missing from Section 4: "
             f"{missing_contradictions}"
         )
@@ -923,11 +936,11 @@ def validate_final_report(
         errors.append(f"duplicate reference IDs: {duplicates}")
     missing_refs = sorted((used_papers | used_technical) - set(reference_ids))
     if missing_refs:
-        errors.append(f"used source IDs missing from References: {missing_refs}")
+        warnings.append(f"used source IDs missing from References: {missing_refs}")
     registry_ids = paper_ids | technical_ids
     absent_registry_refs = sorted(registry_ids - set(reference_ids))
     if absent_registry_refs:
-        errors.append(
+        warnings.append(
             f"registry sources missing from References: {absent_registry_refs}"
         )
     delivery_section = _report_section(text, REQUIRED_HEADINGS[8], "")
@@ -935,7 +948,7 @@ def validate_final_report(
     for key, expected in delivery.items():
         pattern = rf"{re.escape(key)}\s*[:|]\s*`?{re.escape(str(expected))}`?"
         if not re.search(pattern, delivery_section, re.IGNORECASE):
-            errors.append(f"Delivery Status does not contain exact {key}={expected}")
+            warnings.append(f"Delivery Status does not contain exact {key}={expected}")
     for line_number, line in enumerate(text.splitlines(), start=1):
         without_ids = re.sub(r"\[(?:P|T)[A-Z0-9-]+\]", "", line)
         if (

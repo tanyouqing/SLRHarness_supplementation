@@ -383,7 +383,7 @@ def test_runner_uses_one_named_coordinator_and_resumes(tmp_path: Path) -> None:
     attempts: list[int] = []
 
     def fake_batch(workspace, invocations, timeout):
-        assert timeout == 3600
+        assert timeout == 7200
         for invocation in invocations:
             attempts.append(invocation.attempt)
             write_valid_topic(workspace, invocation.task.topic_path)

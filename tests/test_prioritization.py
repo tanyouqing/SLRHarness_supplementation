@@ -297,5 +297,66 @@ def test_prioritization_config_defaults_and_invalid_enums(tmp_path: Path) -> Non
     config_path = tmp_path / "config.json"
     config_path.write_text('{"schema_version":"1.0"}', encoding="utf-8")
     assert load_config(config_path).prioritization == PrioritizationConfig()
+
+
+def test_transposed_research_line_table_and_prose_factors_compile() -> None:
+    scope = """# Scope
+
+## Research-Line Prioritization and Synthesis Policy
+### 10.1 Ranking Unit
+research_line
+### 10.3 Proposed Research Lines
+| Field | `RL-MEM-WRITE` | `RL-MEM-RETRIEVE` |
+|---|---|---|
+| **Primary Group** | G1 | G1 |
+| **Definition** | Write path | Retrieve path |
+| **Base tier (scope gate)** | Core | Supporting |
+### 10.5 Priority Tiers (ordinal)
+Core, then Supporting, then Peripheral, then Insufficient Evidence
+### 10.6 Priority Factors
+**PF1 — Scope centrality.**
+- `High`: directly about agent memory.
+- `Medium`: adjacent component.
+- `Low`: boundary only.
+- `Unknown`: not assessed.
+**PF2 — Evidence strength.**
+- `High`: multiple evaluated systems.
+- `Medium`: some evaluation.
+- `Low`: none.
+- `Unknown`: not collected.
+### Missing-Data Policy
+Unknown is never zero.
+"""
+    contract = compile_scope_prioritization(scope)
+    assert contract["compile_status"] == "COMPLETE"
+    assert [line["line_id"] for line in contract["research_lines"]] == [
+        "RL-MEM-WRITE",
+        "RL-MEM-RETRIEVE",
+    ]
+    assert contract["research_lines"][0]["group"] == "G1"
+    assert {factor["factor_id"] for factor in contract["factors"]} >= {"PF1", "PF2"}
+    assert contract["primary_ordering"] == [
+        "Core",
+        "Supporting",
+        "Peripheral",
+        "Insufficient Evidence",
+    ]
+
+
+def test_inline_rl_ids_recovered_when_no_table() -> None:
+    scope = """## Research-Line Prioritization and Synthesis Policy
+### Ranking Unit
+The ranking unit is the research line.
+### Ranking Mode
+ordinal
+### Priority Tiers
+Core / Supporting / Peripheral / Insufficient Evidence
+Lines discussed: RL-ALPHA-MEMORY and RL-BETA-TOOLS.
+"""
+    contract = compile_scope_prioritization(scope)
+    ids = [line["line_id"] for line in contract["research_lines"]]
+    assert "RL-ALPHA-MEMORY" in ids
+    assert "RL-BETA-TOOLS" in ids
+
     with pytest.raises(ValueError, match="default_mode"):
         PrioritizationConfig(default_mode="invented")

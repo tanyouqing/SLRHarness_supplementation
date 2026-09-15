@@ -80,7 +80,12 @@ from slrharness.scope_workflow import (
     load_scope_state,
     state_path,
 )
-from slrharness.source_registry import normalize_arxiv, normalize_doi, parse_frontmatter
+from slrharness.source_registry import (
+    normalize_arxiv,
+    normalize_doi,
+    parse_frontmatter,
+    write_frontmatter_field,
+)
 from slrharness.tmux_runner import (
     WorkerSpec,
     capture_pane,
@@ -108,8 +113,9 @@ from slrharness.workspace_assets import deploy_claude_assets
 
 DEFAULT_MAX_ROUNDS = 5
 DEFAULT_NUM_WORKERS = 3
-DEFAULT_WORKER_TIMEOUT = 600  # seconds
-DEFAULT_MANAGER_TIMEOUT = 900  # seconds (manager does heavier reasoning)
+# Generous defaults: retrieval + multi-agent synthesis often exceeds 10 minutes.
+DEFAULT_WORKER_TIMEOUT = 1800  # seconds
+DEFAULT_MANAGER_TIMEOUT = 3600  # seconds (manager does heavier reasoning)
 
 WORKER_SESSION = "slr-workers"
 COORDINATOR_SESSION = "slr-topic-coordinators"
@@ -1414,7 +1420,54 @@ def _run_program_topic(
                 paths.task_id,
                 correction_rounds_used=correction_round,
             )
+            # Program-first repairs: if the checker already verified a value,
+            # apply it deterministically. Only leftover issues need an agent.
+            leftover_repairs: list[dict] = []
             for issue in repair_issues:
+                field_name = str(issue.get("field") or "")
+                verified = (issue.get("evidence") or {}).get("verified")
+                target = workspace / str(issue.get("target") or "")
+                if (
+                    field_name
+                    and verified not in (None, "")
+                    and target.is_file()
+                    and str(issue.get("target", "")).startswith(prefix)
+                ):
+                    if write_frontmatter_field(target, field_name, verified):
+                        issue_id = str(issue["issue_id"])
+                        # Legal path: open/unresolved -> repair_dispatched -> applied
+                        if issue.get("status") != "repair_dispatched":
+                            transition_issue(
+                                workspace, issue_id, "repair_dispatched"
+                            )
+                        transition_issue(
+                            workspace, issue_id, "applied",
+                            applied_by_invocation=f"program-verified-{issue_id}"
+                        )
+                        _record_stage_invocation(
+                            workspace, paths.task_id,
+                            f"{paths.task_id}-program-repair-{issue['issue_id']}",
+                            config.academic_agent, "METADATA_FINISHED", attempt,
+                            staging_directory(
+                                workspace,
+                                f"{paths.task_id}-program-repair-{issue['issue_id']}",
+                            ),
+                            "COMPLETE",
+                        )
+                        continue
+                leftover_repairs.append(issue)
+
+            # Cap agent-mediated repairs to avoid one-call-per-field storms.
+            max_agent_repairs = max(0, int(getattr(config, "max_metadata_repairs", 6)))
+            if len(leftover_repairs) > max_agent_repairs:
+                for issue in leftover_repairs[max_agent_repairs:]:
+                    transition_issue(
+                        workspace, str(issue["issue_id"]), "unresolved",
+                        diagnostic="skipped agent repair: per-topic repair cap reached",
+                    )
+                leftover_repairs = leftover_repairs[:max_agent_repairs]
+
+            for issue in leftover_repairs:
                 if issue.get("status") != "repair_dispatched":
                     transition_issue(
                         workspace, str(issue["issue_id"]), "repair_dispatched"
@@ -1822,14 +1875,30 @@ def run_finalization_pipeline(
             if ledger_blockers
             else "incomplete topic tasks: " + ", ".join(incomplete_tasks)
         )
-        update_finalization_state(
-            workspace,
-            "AWAITING_INTERVENTION",
-            config,
-            failure=failure,
-        )
-        _commit_finalization_artifacts(workspace, "finalization: blocked")
-        return False
+        if config.allow_finalize_with_limitations:
+            # Disclose blockers in the final report instead of stalling when
+            # repair budget is exhausted or topics are incomplete.
+            update_finalization_state(
+                workspace,
+                "READY_FOR_FINAL_SYNTHESIS",
+                config,
+                source_counts={
+                    "papers": len((registry or {}).get("papers", [])),
+                    "technical_sources": len(
+                        (registry or {}).get("technical_sources", [])
+                    ),
+                },
+                failure=f"disclosed blockers: {failure}",
+            )
+        else:
+            update_finalization_state(
+                workspace,
+                "AWAITING_INTERVENTION",
+                config,
+                failure=failure,
+            )
+            _commit_finalization_artifacts(workspace, "finalization: blocked")
+            return False
     if (
         audit.get("status") == "PASS_WITH_LIMITATIONS"
         and not config.allow_finalize_with_limitations
@@ -2275,7 +2344,7 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument("--finalizer-timeout", type=int, default=1800)
+    parser.add_argument("--finalizer-timeout", type=int, default=3600)
     parser.add_argument("--finalizer-retries", type=int, default=1)
     parser.add_argument(
         "--allow-complete-with-warnings",

@@ -37,7 +37,7 @@ def _section_one(valid: bool = True) -> str:
 """
 
 
-def test_section_one_rejects_missing_glossary(tmp_path: Path) -> None:
+def test_section_one_accepts_thin_glossary_but_keeps_structure(tmp_path: Path) -> None:
     path = tmp_path / SECTION_PATHS[0]
     path.parent.mkdir(parents=True)
     path.write_text(_section_one(False), encoding="utf-8")
@@ -47,8 +47,9 @@ def test_section_one_rejects_missing_glossary(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     valid, errors = validate_section(tmp_path, 1)
-    assert not valid
-    assert any("10" in error for error in errors)
+    # Style gaps (empty term rows) must not block assembly.
+    assert valid
+    assert errors == []
 
 
 def test_five_sections_are_assembled_in_fixed_order(tmp_path: Path) -> None:

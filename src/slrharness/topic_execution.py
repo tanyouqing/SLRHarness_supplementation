@@ -36,24 +36,25 @@ class TopicExecutionConfig:
     mode: str = LEGACY_WORKER
     coordinator_agent: str = "topic-coordinator"
     allow_partial_completion: bool = True
-    coordinator_timeout_seconds: int = 3600
-    coordinator_max_turns: int = 80
+    coordinator_timeout_seconds: int = 7200
+    coordinator_max_turns: int = 120
     coordinator_retries: int = 1
     academic_agent: str = "academic-paper-worker"
-    academic_max_turns: int = 35
+    academic_max_turns: int = 50
     target_papers: int = 4
     max_paper_candidates: int = 12
     enable_backward_citation_search: bool = True
     enable_forward_citation_search: bool = True
     metadata_agent: str = "academic-metadata-checker"
-    metadata_max_turns: int = 20
+    metadata_max_turns: int = 30
     max_correction_rounds: int = 1
+    max_metadata_repairs: int = 6
     unresolved_metadata_is_fatal: bool = False
     technical_agent: str = "technical-source-worker"
-    technical_max_turns: int = 25
+    technical_max_turns: int = 40
     target_technical_sources: int = 1
     max_technical_candidates: int = 5
-    message_wait_seconds: int = 300
+    message_wait_seconds: int = 600
     enable_send_message: bool = False
     persist_coordination_log: bool = True
     file_fallback: bool = True
@@ -541,6 +542,12 @@ frontmatter field and do not declare the issue resolved.
 """
     if role == config.academic_agent:
         return common + f"""
+HARD BUDGET (stop when reached; do not keep searching):
+- Include at most {config.target_papers} paper notes in the imported set.
+- Inspect at most {config.max_paper_candidates} initial candidates.
+- After the include budget is met, do not open new candidates or citation hops.
+- Prefer 1-2 well-identified papers over a long candidate list.
+
 Search and read academic papers for this topic. Write only research-content
 paper Markdown (or NO_RESULTS.md) below {staging / 'papers'}. Filenames are
 temporary; the program imports and names canonical notes. Follow the configured
@@ -548,6 +555,10 @@ MCP fallback and citation-chaining policy. Do not write control fields.
 """
     if role == config.technical_agent:
         return common + f"""
+HARD BUDGET (stop when reached; do not keep searching):
+- Include at most {config.target_technical_sources} technical notes.
+- Inspect at most {config.max_technical_candidates} initial candidates.
+
 Search and read technical sources for this topic. Write only research-content
 technical Markdown (or NO_RESULTS.md) below {staging / 'technical'}. Filenames
 are temporary; the program imports them. Keep non-peer-reviewed evidence clear.
