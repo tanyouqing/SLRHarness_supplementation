@@ -37,6 +37,10 @@ def test_workspace_path_and_project_lock_are_bounded(tmp_path: Path) -> None:
     workspace = tmp_path / "project"
     (workspace / ".git").mkdir(parents=True)
     assert workspace_path(workspace, "topics/a.md").is_relative_to(workspace)
+    inside = workspace / "topics/a.md"
+    inside.parent.mkdir(parents=True, exist_ok=True)
+    inside.write_text("x", encoding="utf-8")
+    assert workspace_path(workspace, str(inside.resolve())) == inside.resolve()
     with pytest.raises(ValueError):
         workspace_path(workspace, "../escape")
     with (

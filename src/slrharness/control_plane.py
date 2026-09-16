@@ -394,9 +394,13 @@ def ingest_metadata_observation(
     checked = observation.get("checked_fields")
     if not target or not isinstance(checked, dict):
         raise ValueError("metadata observation needs note_path and checked_fields")
-    target_path = workspace_path(workspace, target)
+    try:
+        target_path = workspace_path(workspace, target)
+    except ValueError:
+        # Unusable path: skip this observation rather than abort the topic run.
+        return []
     if not target_path.is_file() or not target_path.suffix.lower() == ".md":
-        raise ValueError("metadata observation target must be an existing Markdown note")
+        return []
     target = target_path.relative_to(workspace.resolve()).as_posix()
     created: list[Issue] = []
     existing = current_issues(workspace)
@@ -434,24 +438,40 @@ def apply_verification_observation(
     checked = observation.get("checked_fields")
     if not isinstance(checked, dict):
         raise ValueError("metadata observation needs checked_fields")
+    # Normalize absolute vs workspace-relative note_path for issue matching.
+    normalized_target = target
+    try:
+        normalized_target = (
+            workspace_path(workspace, target)
+            .relative_to(workspace.resolve())
+            .as_posix()
+        )
+    except (ValueError, OSError):
+        normalized_target = target.replace("\\", "/")
     changed: list[str] = []
     for identifier, issue in current_issues(workspace).items():
-        if issue.get("target") != target or issue.get("status") != "applied":
+        issue_target = str(issue.get("target") or "").replace("\\", "/")
+        if issue_target not in {target, normalized_target}:
+            continue
+        if issue.get("status") != "applied":
             continue
         details = checked.get(str(issue.get("field")))
         if not isinstance(details, dict):
             continue
         status = "verified_closed" if details.get("match") is True else "unresolved"
-        transition_issue(
-            workspace,
-            identifier,
-            status,
-            verification={
-                "observed": details.get("observed"),
-                "verified": details.get("verified"),
-                "source": details.get("source"),
-            },
-        )
+        try:
+            transition_issue(
+                workspace,
+                identifier,
+                status,
+                verification={
+                    "observed": details.get("observed"),
+                    "verified": details.get("verified"),
+                    "source": details.get("source"),
+                },
+            )
+        except (KeyError, ValueError):
+            continue
         changed.append(identifier)
     return changed
 

@@ -114,9 +114,14 @@ def check_schema_version(
 def workspace_path(workspace: Path, value: str | Path) -> Path:
     """Resolve a workspace-relative path and reject traversal/absolute escape."""
     raw = Path(value)
-    if raw.is_absolute():
-        raise ValueError(f"workspace artifact path must be relative: {value}")
     root = workspace.resolve()
+    if raw.is_absolute():
+        # Agents sometimes echo absolute host paths; accept them only when
+        # they still live inside this workspace.
+        resolved_abs = raw.resolve()
+        if not resolved_abs.is_relative_to(root):
+            raise ValueError(f"workspace artifact path escapes workspace: {value}")
+        return resolved_abs
     resolved = (root / raw).resolve()
     if not resolved.is_relative_to(root):
         raise ValueError(f"workspace artifact path escapes workspace: {value}")

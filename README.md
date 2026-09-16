@@ -1,11 +1,18 @@
 # SLRHarness
 
-**Scientific Literature Review Harness** — an agentic system for conducting reproducible literature reviews using CLI agents (Kiro, Claude Code, etc.) in a manager–worker loop.
+**Scientific Literature Review Harness** — an artifact-first system for conducting
+reproducible literature reviews with CLI agents (Kiro, Claude Code, etc.).
 
 SLRHarness turns an initial research direction into an approved, structured,
 version-controlled literature review. A Python orchestrator owns lifecycle state,
 validation, retry, and Git boundaries; bounded Claude Code agents own research and
 written synthesis.
+
+The current canonical path is state-driven rather than agent-driven. Python owns
+`SLR_STATE.json`, task and invocation IDs, staging imports, issue transitions,
+artifact compilation, source aggregation, report assembly, and completion. Agents
+produce research observations and Markdown content; their reported counts,
+statuses, paths, and completion claims are never authoritative.
 
 See [`docs/architecture.md`](docs/architecture.md),
 [`docs/artifact-contracts.md`](docs/artifact-contracts.md), and
@@ -93,12 +100,19 @@ claude --version
 claude -p "Reply with OK"
 ```
 
+SLRHarness currently invokes Claude Code with
+`--dangerously-skip-permissions`, so run it only in a dedicated, disposable
+container or VM with restricted filesystem mounts, network egress, and no host
+credentials. Prefer a non-root user inside that boundary. Claude Code rejects
+this flag for UID 0 unless it is told that an external sandbox already exists;
+see [Root users and sandboxed execution](#root-users-and-sandboxed-execution).
+
 Create a scope project from a preliminary direction. This command creates an
 independent Git workspace, deploys the project-scoped Claude agents and skill,
 runs `slr-scoper`, writes a proposal, and then exits at the approval gate.
 
 ```bash
-uv run python -m slrharness.scope prepare \
+uv run slrharness scope prepare \
   --theme "agent memory" \
   --topic "Agent memory for LLM-based autonomous agents" \
   --agent-backend claude-code
@@ -108,14 +122,14 @@ It does **not** start the manager or formal workers. Inspect the current state,
 proposal, and source-attempt log:
 
 ```bash
-uv run python -m slrharness.scope show \
+uv run slrharness scope show \
   --workspace workspaces/agent-memory
 ```
 
 Request a new, auditable revision when boundaries need adjustment:
 
 ```bash
-uv run python -m slrharness.scope revise \
+uv run slrharness scope revise \
   --workspace workspaces/agent-memory \
   --feedback "Exclude ordinary RAG and focus on persistent autonomous-agent memory." \
   --agent-backend claude-code
@@ -124,7 +138,7 @@ uv run python -m slrharness.scope revise \
 Approve the exact revision printed by `scope show`:
 
 ```bash
-uv run python -m slrharness.scope approve \
+uv run slrharness scope approve \
   --workspace workspaces/agent-memory \
   --revision 2
 ```
@@ -134,7 +148,7 @@ Approval copies the proposal unchanged into `SCOPE.md` and
 sets `formal_research_allowed` to true. Only then can the existing loop run:
 
 ```bash
-uv run python -m slrharness.orchestrator run \
+uv run slrharness run \
   --workspace workspaces/agent-memory \
   --agent-backend claude-code \
   --max-rounds 5
@@ -144,7 +158,7 @@ If scope preparation was interrupted or failed validation, retry the same
 revision without losing its state or earlier revision archives:
 
 ```bash
-uv run python -m slrharness.scope resume \
+uv run slrharness scope resume \
   --workspace workspaces/agent-memory \
   --agent-backend claude-code
 ```
@@ -160,7 +174,7 @@ Treat a complete file as a draft and let the scope agent research and improve
 it:
 
 ```bash
-uv run python -m slrharness.scope prepare \
+uv run slrharness scope prepare \
   --theme "agent memory" \
   --draft-scope my-scope.md \
   --agent-backend claude-code
@@ -170,13 +184,13 @@ Or explicitly declare the supplied file already approved and skip preliminary
 scope research:
 
 ```bash
-uv run python -m slrharness.scope init \
+uv run slrharness scope init \
   --theme "agent memory" \
   --approved-scope my-scope.md
 ```
 
-The historical command without an `init` subcommand remains supported and is
-also treated as an explicit, already-approved input:
+The historical module command without an `init` subcommand remains supported
+and is also treated as an explicit, already-approved input:
 
 ```bash
 uv run python -m slrharness.scope --theme "agent memory" --scope my-scope.md
@@ -229,7 +243,7 @@ the original single-worker and coordinator artifacts remain readable for
 legacy migration. Run:
 
 ```bash
-uv run python -m slrharness.orchestrator run \
+uv run slrharness run \
   --workspace workspaces/agent-memory \
   --agent-backend claude-code \
   --topic-execution-mode topic_coordinator \
@@ -261,14 +275,21 @@ artifacts/staging/<invocation-id>/           # non-canonical agent output
 topics/<topic>/<subtopic>.md                 # topic synthesis
 topics/<topic>/<subtopic>/papers/*.md        # canonical paper notes
 topics/<topic>/<subtopic>/technical_sources/*.md
+topics/<topic>/<subtopic>/task.json           # program-owned topic contract/state
+topics/<topic>/<subtopic>/checkpoint.json     # recoverable artifact inventory
+topics/<topic>/<subtopic>/coordinator_manifest.json
+topics/<topic>/<subtopic>/audits/             # normalization/metadata/correction traces
 sections/01-terminology-scope.md             # through section 05
 SUMMARY.md                                   # deterministic program assembly
 ```
 
-New workspaces no longer generate per-topic task/contract/manifest/checkpoint,
-coordination logs, metadata queues, or Markdown indexes. Legacy workspaces can
-still load them once during migration; they are then read-only. Agent-authored
-IDs, counts, statuses, timestamps, and canonical paths are diagnostic only.
+For current runs, the Harness generates the per-topic contract, checkpoint,
+indexes, audit files, and coordinator manifest from discovered artifacts. These
+files remain canonical program output; agents do not own their IDs, counts,
+statuses, timestamps, or paths. Legacy agent-authored versions can be imported
+as observations and rebuilt. `TASKS.md` is likewise a human-readable projection
+of `SLR_STATE.json`, not an independent source of executable work after state
+migration.
 
 To inspect or rebuild one topic without Claude or tmux:
 
@@ -368,7 +389,7 @@ topic completion
 subcommand resumes this pipeline without rerunning completed topics:
 
 ```bash
-uv run python -m slrharness.orchestrator finalize \
+uv run slrharness finalize \
   --workspace workspaces/agent-memory \
   --agent-backend claude-code \
   --topic-execution-mode topic_coordinator
@@ -448,10 +469,13 @@ not Ralph Loop or Agent Teams.
 
 ### Five-section English report and validation
 
-The Manager is reused as the Finalizer because it already owns `SUMMARY.md`
-and Git commits. It receives explicit scope, topic, registry, paper-list,
-references, note-root, and audit paths and has no search MCP. It must write, in
-order:
+The Manager role is reused as a bounded report writer. The program first builds
+an explicit report packet from the approved scope, topic syntheses, registry,
+paper list, generated references, note roots, and audits. It invokes and
+validates the five report sections, then assembles them deterministically with
+coverage, provenance, references, and exact delivery statistics into the sole
+canonical `SUMMARY.md`. Report-writing invocations have no search responsibility.
+The five generated sections are, in order:
 
 1. Academic Terminology and Problem Boundaries
 2. Background, Importance, and Broader Significance
@@ -467,14 +491,14 @@ claim citations, placeholders, English-language mixing, canonical path, and
 exact program-provided Delivery Status counts. A zero exit code alone never
 marks the review complete.
 
-Errors trigger only a bounded Finalizer retry and are passed back as precise
-diagnostics; completed topic research is not rerun. Warnings are recorded and
-may complete by default; use `--no-allow-complete-with-warnings` for strict
-handling. Inspect progress and audits with implemented commands:
+Section or final-report errors trigger only bounded report-writer retries with
+precise diagnostics; completed topic research is not rerun. Warnings are
+recorded and may complete by default; use
+`--no-allow-complete-with-warnings` for strict handling. Inspect progress and
+audits with implemented commands:
 
 ```bash
-uv run python -m slrharness.orchestrator status \
-  --workspace workspaces/agent-memory
+uv run slrharness status workspaces/agent-memory
 
 cat workspaces/agent-memory/artifacts/audits/prefinal_audit.json
 cat workspaces/agent-memory/artifacts/audits/final_audit.json
@@ -485,6 +509,35 @@ same `finalize` command. It rebuilds aggregation safely, does not duplicate
 stable repair tasks, preserves failed report drafts under
 `artifacts/final_drafts/`, and skips report generation once a valid COMPLETE
 state exists.
+
+### Root users and sandboxed execution
+
+Claude Code intentionally rejects `--dangerously-skip-permissions` when the
+process runs as root. Current Claude Code builds also recognize
+`IS_SANDBOX=1` as an escape hatch for environments that are **already** isolated:
+
+```bash
+IS_SANDBOX=1 uv run slrharness run \
+  --workspace workspaces/agent-memory \
+  --agent-backend claude-code \
+  --topic-execution-mode topic_coordinator
+```
+
+Use this only inside a container or VM whose isolation is independently
+enforced. `IS_SANDBOX=1` does not create a sandbox, restrict mounts, filter
+network access, or make root safe; it only suppresses Claude Code's root guard.
+It is currently an implementation-level compatibility mechanism rather than a
+documented stable Claude Code interface, so it may change between releases.
+Prefer running Claude Code as a non-root user. If root is unavoidable, mount
+only the review workspace, do not mount SSH/cloud credentials or the Docker
+socket, restrict outbound network access, and verify the boundary before
+setting the variable. See Claude Code's official
+[sandboxing](https://code.claude.com/docs/en/sandboxing),
+[permissions](https://code.claude.com/docs/en/permissions), and
+[development-container](https://code.claude.com/docs/en/devcontainer) guidance.
+The current root-guard behavior and escape-hatch condition are also discussed
+in the upstream
+[Claude Code issue](https://github.com/anthropics/claude-code/issues/58197).
 
 ### Scope workspace files and discovery
 
@@ -499,7 +552,7 @@ scope_revisions/revision-N/
 .claude/agents/{slr-scoper,slr-manager,slr-worker,topic-coordinator,
   academic-paper-worker,academic-metadata-checker,technical-source-worker}.md
 .claude/skills/{slr-scoping,slr-topic-research}/SKILL.md
-.claude/templates/{paper-note,final-report}.md
+.claude/templates/{paper-note,technical-note,report-section-01..05,final-report}.md
 ```
 
 `SLR_STATE.json` records the initial topic, current status and revision,
@@ -562,33 +615,38 @@ Other platforms can adapt the reference definitions to their own format.
 
 ### 3. Initialize a workspace
 
-This creates `workspaces/{theme-slug}/` as an **independent git repository** (not tracked by the outer SLRHarness repo), copies your scope to `SCOPE_ORIGINAL.md` (immutable) and `SCOPE.md` (living), and commits it as `round-0`.
+This creates `workspaces/{theme-slug}/` as an **independent git repository**
+(not tracked by the outer SLRHarness repo), copies the approved scope to
+`SCOPE_ORIGINAL.md` and `SCOPE.md`, and commits it as `round-0`. Both scope files
+are read-only during formal research; proposed future changes remain notes rather
+than silently changing the approved contract.
 
 ```bash
-uv run python -m slrharness.scope \
+uv run slrharness scope init \
   --theme "transformer efficiency" \
-  --scope my-scope.md
+  --approved-scope my-scope.md
 ```
 
 Flags:
 
 - `--theme` (required) — free-form; slugified to a directory name
-- `--scope` (required) — path to the filled-in scope file
+- `--approved-scope` (required) — path to the explicitly approved scope file
 - `--workspaces-dir` — parent directory for workspaces (default: `./workspaces`)
 - `--force` — overwrite an existing workspace with the same slug
 
 ### 4. Run the review loop
 
 ```bash
-uv run python -m slrharness.orchestrator run \
+uv run slrharness run \
   --workspace workspaces/transformer-efficiency \
   --agent-backend kiro \
   --max-rounds 5 \
   --num-workers 3 \
-  --worker-timeout 600
+  --worker-timeout 1800
 ```
 
-(The `run` subcommand is the default; `uv run python -m slrharness.orchestrator --workspace ...` without `run` works too.)
+Historical module entry points remain compatible, but the installed
+`slrharness` command is canonical.
 
 Flags:
 
@@ -596,8 +654,8 @@ Flags:
 - `--agent-backend` — which agent CLI to use: `kiro` (default) or `claude-code`
 - `--max-rounds` — **additional** rounds to run from the current state (default: `5`). When resuming, this is rounds on top of whatever is already committed.
 - `--num-workers` — max parallel workers per round (default: `3`)
-- `--worker-timeout` — per-worker timeout in seconds (default: `600`)
-- `--manager-timeout` — per-manager-invocation timeout in seconds (default: `900`)
+- `--worker-timeout` — per-worker timeout in seconds (default: `1800`)
+- `--manager-timeout` — per-manager-invocation timeout in seconds (default: `3600`)
 - `--allow-dirty` — proceed even if the workspace has uncommitted changes (they'll be folded into the next manager commit)
 - `--topic-execution-mode` — `legacy_worker` (default) or `topic_coordinator`
 - `--coordinator-timeout` — shared timeout for a coordinator batch (default: `3600`)
@@ -612,7 +670,9 @@ Flags:
 - `--finalizer-timeout`, `--finalizer-retries` — bounded Manager Finalizer runs
 - `--[no-]allow-complete-with-warnings` — control warning-only completion
 
-Each round runs as: **manager plan pass → workers (parallel) → manager review pass**. The manager owns all control files and commits twice per round (`round-N-plan`, `round-N-review`). Workers write only to `topics/` and `assets/`.
+Each round runs as: **manager plan pass → program-scheduled topic stages →
+manager review pass**. Python owns lifecycle/task state and re-renders
+`TASKS.md`; Manager owns synthesis content and the required Git phase commits.
 
 ### Resuming a review
 
@@ -620,7 +680,7 @@ Just re-run the same command on the same workspace. The orchestrator detects com
 
 ```bash
 # Did 10 rounds, now want 5 more
-uv run python -m slrharness.orchestrator run \
+uv run slrharness run \
   --workspace workspaces/transformer-efficiency \
   --max-rounds 5
 ```
@@ -628,8 +688,7 @@ uv run python -m slrharness.orchestrator run \
 To see where you are before resuming:
 
 ```bash
-uv run python -m slrharness.orchestrator status \
-  --workspace workspaces/transformer-efficiency
+uv run slrharness status workspaces/transformer-efficiency
 ```
 
 This prints the last completed round, next round to run, whether the git tree is clean, pending/completed task counts, and recent commit history. The orchestrator refuses to start on a dirty tree unless you pass `--allow-dirty`.
@@ -681,17 +740,24 @@ slrharness/
 │   ├── agents/
 │   │   ├── slr-scoper.md           # Claude scope-preparation agent
 │   │   ├── slr-manager.md          # Claude manager agent
-│   │   ├── slr-worker.md           # Claude worker agent
+│   │   ├── slr-worker.md           # Legacy Claude topic worker
+│   │   ├── topic-coordinator.md     # Validated-note topic synthesis
+│   │   ├── academic-paper-worker.md
+│   │   ├── academic-metadata-checker.md
+│   │   ├── technical-source-worker.md
 │   │   ├── slr-manager.json        # Kiro/reference manager config
 │   │   └── slr-worker.json         # Kiro/reference worker config
-│   └── skills/slr-scoping/
-│       └── SKILL.md                # Scoping best practices
+│   ├── skills/                     # Scope and topic research contracts
 │   ├── templates/                  # Canonical paper/final report contracts
-│   └── config/example-config.yaml  # Key-free configuration reference
+│   └── config/example-config.json  # Key-free configuration reference
 ├── src/slrharness/
 │   ├── __init__.py
 │   ├── agent_backends.py           # Agent platform abstraction & registry
-│   ├── orchestrator.py             # Main loop, CLI, task parsing
+│   ├── orchestrator.py             # Round/topic/finalization scheduler
+│   ├── control_plane.py            # Authoritative tasks, invocations, issues
+│   ├── artifact_compiler.py        # Staging import and topic normalization
+│   ├── report_sections.py          # Section validation and report assembly
+│   ├── prioritization.py           # Scope-to-research-line contract
 │   ├── scope_workflow.py            # Scope state, revisions, approval gate
 │   ├── tmux_runner.py              # Parallel spawn + wait-for sync
 │   ├── workspace_assets.py          # Workspace agent/skill deployment
@@ -710,9 +776,12 @@ slrharness/
 │       ├── .git/
 │       ├── SCOPE_ORIGINAL.md       # Immutable baseline
 │       ├── SCOPE.md                # Living scope
-│       ├── TASKS.md                # Task registry (manager-owned)
-│       ├── SUMMARY.md              # Evolving synthesis
-│       ├── topics/                 # Worker output
+│       ├── SLR_STATE.json          # Authoritative lifecycle/task state
+│       ├── TASKS.md                # Program-rendered task projection
+│       ├── SUMMARY.md              # Canonical assembled report
+│       ├── topics/                 # Topic synthesis + supporting evidence
+│       ├── artifacts/              # Registry, staging, issues, and audits
+│       ├── sections/               # Validated report sections 01–05
 │       └── assets/                 # Supporting files
 ├── docs/                           # Architecture, contracts and development
 ├── SCOPE_TEMPLATE.md               # Copy-and-fill scope template
@@ -726,17 +795,28 @@ slrharness/
    explicitly approve the generated proposal; or explicitly initialize an
    already-approved scope. Python owns the approval gate and preserves the
    approved content as `SCOPE_ORIGINAL.md`.
-2. **Plan pass.** The manager reads the immutable approved scope and writes
-   bounded pending topic tasks. It cannot change approval or lifecycle state.
-3. **Worker dispatch.** The orchestrator parses `TASKS.md`, extracts up to `--num-workers` pending `- [ ]` lines, and launches each as an agent CLI session in its own tmux window. Workers signal completion via `tmux wait-for` channels.
-4. **Review pass.** The manager validates worker output, marks completed tasks `[x]`, updates `SUMMARY.md`, and commits.
-5. **Repeat and finalize.** Bounded additional rounds end in registry aggregation,
-   pre-final audit/optional repair, one canonical synthesis, validation, and COMPLETE.
+2. **Plan pass.** The manager proposes bounded topic tasks from the immutable
+   approved scope. Python imports them into `SLR_STATE.json`, assigns stable IDs,
+   and renders `TASKS.md`; agents cannot change lifecycle state.
+3. **Staged topic execution.** Academic and technical retrieval run concurrently
+   into invocation staging directories. Python imports and normalizes notes,
+   runs metadata observation, owns exact-field repair and re-check, then invokes
+   the topic coordinator only for synthesis.
+4. **Artifact acceptance and review.** The Harness rebuilds indexes, checkpoint,
+   audits, and manifest from actual files. It accepts only deterministically
+   validated `COMPLETE` or disclosed `PARTIAL` artifacts; Manager Review then
+   updates the evolving synthesis.
+5. **Aggregate and finalize.** Bounded rounds end in global source deduplication,
+   paper-note validation, pre-final audit/optional repair, five-section report
+   generation, deterministic assembly, final validation, and `COMPLETE`.
 
 ## Troubleshooting
 
 - `claude command not found`, login failures, missing Git/tmux, or missing packaged
   agents/templates: run `slrharness doctor` and fix every hard requirement.
+- Root rejection of `--dangerously-skip-permissions`: prefer a non-root container
+  user. Set `IS_SANDBOX=1` only when an external container/VM boundary is already
+  enforced; the variable itself provides no isolation.
 - `agent not found`: rerun the command; workspace assets are deployed automatically.
   Verify `.claude/agents/` rather than copying global files manually.
 - MCP disconnected, Scholar throttled, inaccessible pages, or missing Tavily key:

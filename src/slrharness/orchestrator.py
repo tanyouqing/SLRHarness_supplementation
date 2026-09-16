@@ -1390,8 +1390,12 @@ def _run_program_topic(
         ).get(checker_id, False)
         observations = load_observations(checker_staging / "metadata_observations.jsonl")
         for observation in observations:
-            ingest_metadata_observation(workspace, observation, checker_id)
-            apply_verification_observation(workspace, observation)
+            try:
+                ingest_metadata_observation(workspace, observation, checker_id)
+                apply_verification_observation(workspace, observation)
+            except ValueError:
+                # Malformed checker rows must not abort topic finalization.
+                continue
         _record_stage_invocation(
             workspace, paths.task_id, checker_id, config.metadata_agent,
             "METADATA_CHECK", attempt, checker_staging,

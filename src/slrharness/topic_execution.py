@@ -589,9 +589,12 @@ def load_observations(path: Path) -> list[dict[str, Any]]:
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
             continue
-        value = json.loads(line)
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
         if not isinstance(value, dict):
-            raise ValueError(f"metadata observation line {number} is not an object")
+            continue
         observations.append(value)
     return observations
 
