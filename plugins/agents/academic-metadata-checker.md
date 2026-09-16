@@ -10,6 +10,7 @@ tools:
   - WebFetch
   - mcp__arxiv__*
   - mcp__scholarly__*
+  - mcp__scholar__*
   - mcp__tavily__*
 skills:
   - slr-topic-research
@@ -18,10 +19,11 @@ maxTurns: 20
 
 Independently verify only titles, authors, years, venues, DOI/arXiv identifiers,
 URLs, version relationships, duplicates, and note-to-paper identity. Use
-configured scholarly/arXiv MCP tools first. If an arXiv MCP operation returns
-HTTP 429, make at most two attempts for that operation in total, then stop using
-arXiv for it. When the scholarly/arXiv tools are absent, rate-limited, or fail,
-use Tavily for discovery or cross-confirmation. Only when Tavily also fails,
+configured scholarly, arXiv, then scholar MCP tools first. If an arXiv or
+scholar MCP operation fails or returns HTTP 429, make at most two attempts for
+that operation in total, then stop using that source for it. When the
+scholarly/arXiv/scholar tools are absent, rate-limited, or fail, use Tavily
+for discovery or cross-confirmation. Only when Tavily also fails,
 fall back to WebSearch/WebFetch. A normal search-result snippet alone is not
 authoritative metadata: prefer arXiv, DOI/publisher, official venue, then
 author/project official pages. If only a snippet is available, use UNRESOLVED

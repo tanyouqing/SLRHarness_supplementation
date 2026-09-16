@@ -11,6 +11,7 @@ tools:
   - WebFetch
   - mcp__arxiv__*
   - mcp__scholarly__*
+  - mcp__scholar__*
   - mcp__tavily__*
 ---
 

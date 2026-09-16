@@ -482,17 +482,18 @@ REQUIRED FINAL OUTPUTS:
   program task IDs. Do not modify any file whose producer is `slrharness`.
 
 MCP AND NETWORK FALLBACK:
-- Academic and metadata roles use configured scholarly/arXiv tools first. For
-  an arXiv operation returning HTTP 429, make at most two attempts in total,
-  then switch to Tavily. Also switch to Tavily when scholarly/arXiv tools are
-  absent or fail. Only if Tavily fails, use WebSearch/WebFetch. The metadata
-  checker uses Tavily/WebSearch only for discovery or cross-confirmation; an
-  ordinary search-result snippet alone is not authoritative metadata. Prefer
-  arXiv, DOI/publisher, venue, then author/project official pages. If only a
-  snippet is available, record UNRESOLVED or [UNVERIFIED]. Technical work
-  prefers configured Tavily, then WebSearch/WebFetch. Missing
-  MCPs, rate limits, empty results, inaccessible pages, and missing Tavily keys
-  are non-fatal.
+- Academic and metadata roles use configured scholarly, arXiv, then scholar
+  tools first (same academic tier; try in that order). For an arXiv or scholar
+  operation that fails or returns HTTP 429, make at most two attempts in total
+  for that operation, then switch to Tavily. Also switch to Tavily when
+  scholarly/arXiv/scholar tools are absent or fail. Only if Tavily fails, use
+  WebSearch/WebFetch. The metadata checker uses Tavily/WebSearch only for
+  discovery or cross-confirmation; an ordinary search-result snippet alone is
+  not authoritative metadata. Prefer arXiv, DOI/publisher, venue, then
+  author/project official pages. If only a snippet is available, record
+  UNRESOLVED or [UNVERIFIED]. Technical work prefers configured Tavily, then
+  WebSearch/WebFetch. Missing MCPs, rate limits, empty results, inaccessible
+  pages, and missing Tavily keys are non-fatal.
 - If retrieval is unavailable, write explicit no-result/limited-access records.
   Never fabricate papers, metadata, access depth, sources, or results. Mark
   unverifiable content `[UNVERIFIED]`.

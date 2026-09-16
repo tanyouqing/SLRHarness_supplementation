@@ -17,6 +17,7 @@
 | `.claude/settings.json` | 不是启动必需 | 不生成 |
 | arXiv MCP | 可选但推荐 | 需要用户配置 |
 | scholarly MCP | 可选但推荐 | 需要用户配置 |
+| scholar MCP | 可选但推荐 | 需要用户配置（多源聚合检索） |
 | Tavily MCP | 可选 | 需要用户配置和认证/Key |
 | workspace `.mcp.json` | 不必提供 | 不生成；推荐使用 user-scope MCP |
 | `example-config.json` | 仅用于检查/参考 | 随包提供，但不会自动替代 CLI flags |
@@ -101,11 +102,12 @@ Claude Code 当前有三种常用 MCP scope：
 - `project`：写到项目根目录 `.mcp.json`，可提交给团队，但会要求一次信任确认；
 - `user`：对该用户的所有项目生效，保存在 `~/.claude.json`。
 
-Harness 的 Agent frontmatter 使用 `mcp__arxiv__*`、`mcp__scholarly__*` 和 `mcp__tavily__*`，所以服务器名称应严格使用：
+Harness 的 Agent frontmatter 使用 `mcp__arxiv__*`、`mcp__scholarly__*`、`mcp__scholar__*` 和 `mcp__tavily__*`，所以服务器名称应严格使用：
 
 ```text
 arxiv
 scholarly
+scholar
 tavily
 ```
 
@@ -132,6 +134,19 @@ claude mcp get scholarly
 ```
 
 这也是第三方开源 MCP：[adityak74/mcp-scholarly](https://github.com/adityak74/mcp-scholarly)。基础 arXiv/Scholar 查询通常不需要 Key，但 Google Scholar 抓取可能遇到限流、验证码或空结果。
+
+## 7b. 配置 scholar MCP
+
+`scholar` 是多源聚合学术检索（OpenAlex / Semantic Scholar / arXiv / Crossref 等），与 `scholarly` 不是同一个服务器：
+
+```bash
+claude mcp add --transport stdio --scope user scholar -- uvx scholar-mcp
+claude mcp get scholar
+```
+
+上游项目：[Liyux3/scholar-mcp](https://github.com/Liyux3/scholar-mcp)。核心检索通常无需 API Key；可选 `S2_API_KEY`、`OPENALEX_EMAIL` 等提升覆盖与限流余量。
+
+学术侧推荐顺序：`scholarly` → `arxiv` → `scholar` → Tavily → WebSearch/WebFetch；单个 arXiv/scholar 操作连续失败最多 2 次后换源或回退。
 
 ## 8. 配置 Tavily MCP
 
@@ -353,7 +368,7 @@ uv run slrharness config plugins/config/example-config.json
 1. 在 Linux/WSL 安装 tmux；
 2. 在同一 Linux/WSL 环境安装并登录 Claude Code；
 3. 至少执行一次 `claude -p` 验证非交互调用；
-4. 推荐添加并验证 `arxiv` 和 `scholarly` MCP；Tavily 可选；
+4. 推荐添加并验证 `arxiv`、`scholarly`、`scholar` MCP；Tavily 可选；
 5. 用很小的 topic 运行 opt-in live smoke；
 6. 再运行正式 review，并在 Scope gate 明确批准。
 

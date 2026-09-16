@@ -118,7 +118,7 @@ def doctor(workspace: Path | None = None) -> DiagnosticReport:
     if not os.environ.get("TAVILY_API_KEY"):
         report.warnings.append("optional Tavily capability is not configured")
     report.warnings.append(
-        "optional arXiv/scholarly/Tavily MCP connectivity was not probed; "
+        "optional arXiv/scholarly/scholar/Tavily MCP connectivity was not probed; "
         "use `claude mcp list`"
     )
     return report

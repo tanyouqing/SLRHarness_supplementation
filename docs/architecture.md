@@ -91,9 +91,9 @@ paths are always workspace-relative.
 
 | Role | Preferred | Fallback | Complete outage behavior |
 |---|---|---|---|
-| Scope Agent | scholarly, arXiv | WebSearch/WebFetch, optional Tavily | substantive proposal with `[UNVERIFIED]` and limitations |
-| Academic Worker | scholarly/arXiv and citations | WebSearch/WebFetch | limited-access or `NO_RESULTS.md`; empty results are not an empty field |
-| Metadata Checker | scholarly/arXiv | WebSearch/WebFetch | UNRESOLVED/NOT_CHECKED audit and bounded correction queue |
+| Scope Agent | scholarly, arXiv, scholar | WebSearch/WebFetch, optional Tavily | substantive proposal with `[UNVERIFIED]` and limitations |
+| Academic Worker | scholarly/arXiv/scholar and citations | WebSearch/WebFetch | limited-access or `NO_RESULTS.md`; empty results are not an empty field |
+| Metadata Checker | scholarly/arXiv/scholar | WebSearch/WebFetch | UNRESOLVED/NOT_CHECKED audit and bounded correction queue |
 | Technical Worker | optional Tavily | WebSearch/WebFetch | technical no-result record and limitations |
 | Coordinator | persisted subagent artifacts | file queue | no search responsibility; PARTIAL if evidence remains |
 | Finalizer | registry, notes and audits | limitations disclosure | never searches or adds an unregistered source |

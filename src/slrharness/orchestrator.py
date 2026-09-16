@@ -1751,6 +1751,23 @@ def run_finalization_pipeline(
             for task in parse_pending_tasks(workspace / "TASKS.md")
             if any(gap_id in task.description for gap_id in repair_ids)
         ]
+        if not repair_tasks:
+            # Fallback: control-plane pending tasks may still carry the gap id
+            # even when TASKS.md round-section parsing missed them.
+            repair_tasks = [
+                Task(
+                    str(item["topic_path"]),
+                    str(item.get("description", "")),
+                    str(item.get("execution_mode") or TOPIC_COORDINATOR),
+                    str(item.get("research_line_id") or "NOT_APPLICABLE"),
+                )
+                for item in state_topic_tasks(workspace, status="PENDING")
+                if any(
+                    gap_id in str(item.get("description", ""))
+                    or gap_id.lower() in str(item.get("topic_path", ""))
+                    for gap_id in repair_ids
+                )
+            ]
         if repair_tasks:
             repairs_used += 1
             update_finalization_state(

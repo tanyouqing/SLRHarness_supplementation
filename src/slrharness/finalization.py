@@ -642,12 +642,43 @@ def ensure_stable_repair_tasks(workspace: Path, audit: dict[str, Any]) -> list[s
     if not lines:
         return []
     insertion = "\n".join(lines) + "\n"
-    pending_match = re.search(r"^### Pending\s*$", content, re.MULTILINE)
-    if pending_match:
-        position = pending_match.end()
-        content = content[:position] + "\n" + insertion + content[position:]
+    # Insert into the highest-numbered Round's Pending when present, because
+    # parse_pending_tasks only dispatches from that section.
+    round_matches = list(
+        re.finditer(r"^\s*##\s+Round\s+(\d+)\s*$", content, re.MULTILINE | re.IGNORECASE)
+    )
+    if round_matches:
+        active = max(
+            enumerate(round_matches), key=lambda item: (int(item[1].group(1)), item[0])
+        )[1]
+        following = re.search(
+            r"^\s*##\s+.+$", content[active.end() :], re.MULTILINE
+        )
+        round_end = (
+            active.end() + following.start()
+            if following is not None
+            else len(content)
+        )
+        section = content[active.end() : round_end]
+        pending = re.search(r"^###\s+Pending\s*$", section, re.MULTILINE | re.IGNORECASE)
+        if pending:
+            insert_at = active.end() + pending.end()
+            content = content[:insert_at] + "\n" + insertion + content[insert_at:]
+        else:
+            insert_at = active.end()
+            content = (
+                content[:insert_at]
+                + "\n### Pending\n"
+                + insertion
+                + content[insert_at:]
+            )
     else:
-        content += "\n### Pending\n" + insertion
+        pending_match = re.search(r"^### Pending\s*$", content, re.MULTILINE)
+        if pending_match:
+            position = pending_match.end()
+            content = content[:position] + "\n" + insertion + content[position:]
+        else:
+            content += "\n### Pending\n" + insertion
     atomic_write_text(tasks_path, content)
     return added
 

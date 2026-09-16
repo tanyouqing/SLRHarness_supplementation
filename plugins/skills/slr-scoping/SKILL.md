@@ -21,8 +21,9 @@ bounded orientation search before applying the methodology below:
 2. Seek survey, systematic-review, literature-review, taxonomy, tutorial, or
    overview material. Aim for about three useful sources and normally inspect
    no more than five initial candidates. These are soft budgets, not gates.
-3. Prefer configured scholarly and arXiv MCP tools, then built-in WebSearch and
-   WebFetch, then any optional Tavily tools. Continue when any provider is
+3. Prefer configured scholarly, arXiv, then scholar MCP tools (same academic
+   tier; try in that order), then built-in WebSearch and WebFetch, then any
+   optional Tavily tools. Continue when any provider is
    absent, empty, unavailable, or rate-limited.
 4. Read the abstract, contents, definitions, taxonomy, scope, and limitations
    that are accessible. Record both successful and failed retrieval attempts.

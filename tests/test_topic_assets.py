@@ -22,10 +22,16 @@ def test_topic_agent_definitions_and_skill_are_deployed(tmp_path: Path) -> None:
     assert "SendMessage" not in coordinator.split("---", 2)[1]
     assert "mcp__arxiv__*" in academic
     assert "mcp__scholarly__*" in academic
+    assert "mcp__scholar__*" in academic
     assert "mcp__arxiv__*" in checker
+    assert "mcp__scholar__*" in checker
     assert "mcp__tavily__*" in technical
+    assert "mcp__scholar__*" not in technical
     assert "mcp__tavily__*" in academic
     assert "mcp__tavily__*" in checker
+    scoper = (agents / "slr-scoper.md").read_text(encoding="utf-8")
+    assert "mcp__scholar__*" in scoper
+    assert "mcp__scholar__*" not in manager
     assert "TAVILY_API_KEY=" not in coordinator + academic + checker + technical
     assert "WebSearch" not in manager
     assert "add an unregistered paper" in manager

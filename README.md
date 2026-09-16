@@ -195,6 +195,7 @@ credentials or machine-specific settings:
 ```bash
 claude mcp add --transport stdio --scope user arxiv -- uvx arxiv-mcp-server
 claude mcp add --transport stdio --scope user scholarly -- uvx mcp-scholarly
+claude mcp add --transport stdio --scope user scholar -- uvx scholar-mcp
 claude mcp add --env TAVILY_API_KEY=YOUR_KEY --transport stdio --scope user tavily -- npx -y tavily-mcp@latest
 ```
 
@@ -204,6 +205,7 @@ Verify configuration with:
 claude mcp list
 claude mcp get arxiv
 claude mcp get scholarly
+claude mcp get scholar
 claude mcp get tavily
 ```
 
@@ -213,8 +215,8 @@ scraping can be unstable. Tavily requires a key and is only the last optional
 fallback. Never commit API keys to Git, agent files, prompts, fixtures, logs,
 or scope outputs.
 
-The scope agent falls back from available scholarly and arXiv tools to Claude
-Code WebSearch/WebFetch, then optional Tavily. If all network retrieval fails,
+The scope agent falls back from available scholarly, arXiv, and scholar tools
+to Claude Code WebSearch/WebFetch, then optional Tavily. If all network retrieval fails,
 it must still produce a substantive proposal using limited model knowledge,
 mark those claims `[UNVERIFIED]`, and record the failures in
 `SCOPE_SOURCES.md`. Zero successfully read surveys is valid; it is not evidence
@@ -307,8 +309,8 @@ override the global mode by starting its description with
 `[mode=legacy_worker]` or `[mode=topic_coordinator]`.
 
 Search access is role-scoped: academic worker and metadata checker use
-scholarly/arXiv, then Tavily, then WebSearch/WebFetch; the technical worker uses
-Tavily plus WebSearch/WebFetch. No API key is written to project
+scholarly/arXiv/scholar, then Tavily, then WebSearch/WebFetch; the technical
+worker uses Tavily plus WebSearch/WebFetch. No API key is written to project
 files. Search snippets support discovery and cross-confirmation but are not
 final authoritative metadata; the checker prefers arXiv, DOI/publisher,
 official venue, and author/project pages. This implementation was exercised

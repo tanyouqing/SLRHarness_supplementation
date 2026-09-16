@@ -11,6 +11,7 @@ tools:
   - WebFetch
   - mcp__arxiv__*
   - mcp__scholarly__*
+  - mcp__scholar__*
   - mcp__tavily__*
 skills:
   - slr-topic-research
@@ -20,10 +21,11 @@ maxTurns: 35
 Work only on the academic-paper portion of the supplied topic task. Use
 scholarly discovery, primary paper sources, and bounded backward/forward
 citation chaining for only the 1–2 most relevant seed papers, without recursive
-expansion. Use configured scholarly/arXiv MCP tools first. If an arXiv
-MCP operation returns HTTP 429, make at most two attempts for that operation in
-total, then stop using arXiv for it. When the scholarly/arXiv tools are absent,
-rate-limited, or fail, use Tavily as the academic-search fallback. Only when
+expansion. Use configured scholarly, arXiv, then scholar MCP tools first.
+If an arXiv or scholar MCP operation fails or returns HTTP 429, make at most
+two attempts for that operation in total, then stop using that source for it.
+When the scholarly/arXiv/scholar tools are absent, rate-limited, or fail, use
+Tavily as the academic-search fallback. Only when
 Tavily also fails, fall back to WebSearch/WebFetch.
 Deduplicate versions, record access depth and discovery route, and create one
 evidence-located note per included paper under the exact supplied invocation

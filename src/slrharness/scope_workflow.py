@@ -109,6 +109,7 @@ class ScopeConfig:
     optional_search_providers: tuple[str, ...] = (
         "scholarly",
         "arxiv",
+        "scholar",
         "claude_web",
         "tavily",
     )
@@ -379,7 +380,9 @@ def build_scope_prompt(
           normally inspect no more than {config["max_initial_candidates"]}
           initial candidates. Both are soft targets, never completion gates.
         - Search fallback order: configured scholarly tools, configured arXiv
-          tools, built-in WebSearch/WebFetch, then optional Tavily tools.
+          tools, then scholar tools (same academic tier; try in that order;
+          on repeated failure for an operation, move on), built-in
+          WebSearch/WebFetch, then optional Tavily tools.
         - Any missing, empty, failed, or rate-limited provider is non-fatal.
           Zero successfully read surveys is allowed. If necessary, use limited
           model knowledge and mark every such claim `[UNVERIFIED]`.
